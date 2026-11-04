@@ -1,0 +1,6 @@
+# Binaires generes localement (recompiler avec installer.cmd)
+*.exe
+*.zip
+*.pdb
+bin/
+obj/
