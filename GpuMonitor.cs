@@ -1510,8 +1510,8 @@ public sealed class MainForm : Form
         area.AxisY.Title = "Go/s";
         area.AxisY.Minimum = 0;
         area.AxisY.LabelStyle.Format = "0.0";
-        area.AxisX.Title = "secondes";
-        area.AxisX.LabelStyle.Format = "0";
+        area.AxisX.Title = "heure";
+        area.AxisX.LabelStyle.Format = "HH:mm:ss";
         area.AxisX.MajorGrid.LineColor = Color.Gainsboro;
         area.AxisY.MajorGrid.LineColor = Color.Gainsboro;
         chart.ChartAreas.Add(area);
@@ -1685,18 +1685,16 @@ public sealed class MainForm : Form
             map[g.Index] = ser;
         }
 
-        // abscisse = secondes ecoulees depuis le premier echantillon de la fenetre
-        DateTime t0 = ss[0].T;
+        // abscisse = heure reelle de chaque echantillon
         double dataMax = 0;
         foreach (NvSample smp in ss)
         {
             Series ser;
             if (!map.TryGetValue(smp.Index, out ser)) continue;
-            double x = (smp.T - t0).TotalSeconds;
             // rx et tx sont deja en Go/s (conversion faite par HandleLine)
             double y = Math.Max(smp.Rx, smp.Tx);
             if (y > dataMax) dataMax = y;
-            ser.Points.AddXY(x, y);
+            ser.Points.AddXY(smp.T.ToOADate(), y);
         }
 
         // repere : budget theorique de la liaison la plus rapide detectee.
@@ -1719,8 +1717,19 @@ public sealed class MainForm : Form
         }
         chart.ChartAreas[0].AxisY.Maximum = yMax;
 
-        double span = (ss[ss.Count - 1].T - t0).TotalSeconds;
-        chart.ChartAreas[0].AxisX.Maximum = Math.Max(10, span);
+        // echelle horizontale : plage d'heures couverte par la fenetre.
+        // Le pas d'affichage est choisi pour rester lisible selon la taille
+        // de la fenetre (10 s, 1 min, 5 min ou 15 min entre deux graduations).
+        int win = NvWindowSeconds();
+        double step;
+        if (win <= 120) step = 10;
+        else if (win <= 900) step = 60;
+        else if (win < 3600) step = 300;
+        else step = 900;
+        chart.ChartAreas[0].AxisX.IntervalType = DateTimeIntervalType.Seconds;
+        chart.ChartAreas[0].AxisX.Interval = step;
+        chart.ChartAreas[0].AxisX.Minimum = ss[0].T.ToOADate();
+        chart.ChartAreas[0].AxisX.Maximum = ss[ss.Count - 1].T.ToOADate();
     }
 
     // ---- rafraichissement ----------------------------------------------
@@ -1800,6 +1809,7 @@ public sealed class MainForm : Form
         sb.AppendLine("L'onglet \u00ab Debit PCIe en direct \u00bb ne fait aucune mesure manuelle : il lit la sortie de \u00ab nvidia-smi dmon -s t \u00bb, c'est-a-dire les compteurs du pilote NVIDIA qui comptent les octets effectivement echanges sur le lien PCI Express de chaque carte. Une courbe par carte, rx = trafic vers la carte, tx = trafic depuis la carte, en Go/s.");
         sb.AppendLine("C'est la mesure de reference sur une machine NVIDIA : elle inclut tout le trafic du lien (chargement des poids, transferts d'affichage, NVLink le cas echeant), y compris celui des programmes que vous lancez, par exemple un LLM.");
         sb.AppendLine("La ligne horizontale grise represente le plafond theorique du lien le plus rapide de la machine (generation x largeur, cf. onglet \u00ab Liaisons PCIe \u00bb). Elle n'apparait que si le trafic observe est du meme ordre de grandeur, pour ne pas ecraser les courbes.");
+        sb.AppendLine("L'axe horizontal du graphe affiche l'heure reelle de chaque echantillon (format hh:mm:ss), et non un nombre de secondes ecoulees depuis le debut de la mesure. L'espacement des graduations s'adapte a la fenetre choisie : 10 secondes pour 1 minute, 1 minute pour 5 ou 15 minutes, 5 minutes pour 30 minutes et 15 minutes pour 1 heure.");
         sb.AppendLine("Cet onglet necessite le pilote NVIDIA (nvidia-smi doit etre accessible). Sur une machine sans GPU NVIDIA, il reste vide et l'application fonctionne normalement avec les trois autres onglets.");
         txtNote.Text = sb.ToString();
     }

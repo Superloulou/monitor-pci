@@ -13,7 +13,7 @@ Un seul fichier C#, aucune dépendance, aucun installateur, aucun droit administ
 
 Package prêt à déployer sur n'importe quel PC Windows 11 (x64 ou ARM64) :
 
-**[GpuMonitor-Windows11.zip](./dist/GpuMonitor-Windows11.zip)** — 54 Ko, tag [`v1.2`](../../releases/tag/v1.2)
+**[GpuMonitor-Windows11.zip](./dist/GpuMonitor-Windows11.zip)** — 55 Ko, tag [`v1.3`](../../releases/tag/v1.3)
 
 Lien direct : <https://github.com/Superloulou/monitor-pci/raw/main/dist/GpuMonitor-Windows11.zip>
 
@@ -45,6 +45,10 @@ LLM : il enregistre **tout** le trafic qui passe sur le lien PCIe, sans rien gé
   (débit de la liaison négociée, pas la capacité de la carte). Elle n'est affichée que si le
   trafic mesuré est du même ordre de grandeur.
 - Fenêtre d'affichage réglable : 1 min, 5 min, 15 min (défaut), 30 min, 1 h.
+- **Axe horizontal : l'heure réelle** de chaque échantillon (`hh:mm:ss`), et non un nombre de
+  secondes écoulées depuis le début de la mesure. L'espacement des graduations s'adapte à la
+  fenêtre choisie : 10 secondes pour 1 minute, 1 minute pour 5 et 15 minutes, 5 minutes pour
+  30 minutes, 15 minutes pour 1 heure.
 - Nécessite le **pilote NVIDIA** (`nvidia-smi` livré avec). Sur une machine sans GPU NVIDIA
   (Intel, AMD, GPU intégré), l'onglet reste vide : Windows n'expose pas de compteur de trafic
   PCIe par carte.

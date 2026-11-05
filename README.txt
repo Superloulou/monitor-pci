@@ -168,6 +168,13 @@ verifier a distance.
     1 h. Bouton "Effacer le graphe" pour repartir de zero avant une
     mesure.
 
+  * L'axe horizontal du graphe affiche l'heure reelle de chaque
+    echantillon (format hh:mm:ss), et non un nombre de secondes
+    ecoulees depuis le debut de la mesure. L'espacement des
+    graduations s'adapte a la fenetre choisie : 10 secondes pour
+    1 minute, 1 minute pour 5 ou 15 minutes, 5 minutes pour 30
+    minutes et 15 minutes pour 1 heure.
+
   * La mesure demarre seule des que le programme detecte un pilote
     NVIDIA. Sur un PC sans GPU NVIDIA, l'onglet reste vide et le
     message "nvidia-smi introuvable" s'affiche.
