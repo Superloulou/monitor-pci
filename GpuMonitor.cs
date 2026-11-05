@@ -12,6 +12,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
 using System.Globalization;
+using System.IO;
 using System.Management;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -36,6 +37,12 @@ public sealed class PcieLink
     public bool HasCurSpeed, HasCurWidth, HasMaxSpeed, HasMaxWidth;
 
     public bool HasLink { get { return HasCurSpeed && HasCurWidth; } }
+    /// <summary>Le peripherique est bien un peripherique PCI Express (au moins une
+    /// des quatre proprietes de liaison est exposee par le pilote PCI).</summary>
+    public bool HasPci
+    {
+        get { return HasCurSpeed || HasCurWidth || HasMaxSpeed || HasMaxWidth; }
+    }
 
     public static string GenName(int g)
     {
@@ -107,23 +114,33 @@ public static class Pcie
 
     const int CR_SUCCESS = 0;
     const int CR_NO_SUCH_VALUE = 3;
+    const int CR_INSUFFICIENT_BUFFER = 0x103;   // 259 : la taille requise est renvoyee dans size
 
     static readonly Guid PciSet = new Guid("3AB22E31-8264-4B4E-9AF5-A8D2D8E33E62");
     static readonly Guid DeviceSet = new Guid("A45C254E-DF1C-4ECD-8020-67D146A850E0"); // DeviceDesc / FriendlyName
     static readonly Guid NameSet = new Guid("482BE8AE-677D-41C5-BB8E-1E85765AE41A");   // Device_Name
 
+    // Lit une propriete 32 bits. Le tampon est alloue avant l'appel : la
+    // variante « tampon nul pour connaitre la taille » ne remplit pas size sur
+    // toutes les versions de Windows et faisait perdre toutes les liaisons.
     static bool ReadU32(uint devInst, Guid set, uint pid, out uint value)
     {
         value = 0;
         DEVPROPKEY k = new DEVPROPKEY();
         k.fmtid = set;
         k.pid = pid;
-        int size = 4;
-        IntPtr buf = Marshal.AllocHGlobal(4);
+        int size = 8;
+        int type;
+        IntPtr buf = Marshal.AllocHGlobal(size);
         try
         {
-            int type;
             int cr = CM_Get_DevNode_PropertyW(devInst, ref k, out type, buf, ref size, 0);
+            if (cr == CR_INSUFFICIENT_BUFFER && size >= 4)
+            {
+                Marshal.FreeHGlobal(buf);
+                buf = Marshal.AllocHGlobal(size);
+                cr = CM_Get_DevNode_PropertyW(devInst, ref k, out type, buf, ref size, 0);
+            }
             if (cr != CR_SUCCESS || size < 4) return false;
             value = (uint)Marshal.ReadInt32(buf);
             return true;
@@ -137,13 +154,21 @@ public static class Pcie
         k.fmtid = set;
         k.pid = pid;
         int size = 1024;
+        int type;
         IntPtr buf = Marshal.AllocHGlobal(size);
         try
         {
-            int type;
             int cr = CM_Get_DevNode_PropertyW(devInst, ref k, out type, buf, ref size, 0);
+            if (cr == CR_INSUFFICIENT_BUFFER && size > 2)
+            {
+                Marshal.FreeHGlobal(buf);
+                buf = Marshal.AllocHGlobal(size);
+                cr = CM_Get_DevNode_PropertyW(devInst, ref k, out type, buf, ref size, 0);
+            }
             if (cr != CR_SUCCESS || size <= 2) return null;
-            return Marshal.PtrToStringUni(buf, (size - 2) / 2);
+            int chars = (size - 2) / 2;
+            if (chars > 512) chars = 512;
+            return Marshal.PtrToStringUni(buf, chars);
         }
         finally { Marshal.FreeHGlobal(buf); }
     }
@@ -155,12 +180,46 @@ public static class Pcie
         return new string(b).TrimEnd('\0');
     }
 
-    public static uint Locate(string instanceId)
+    // Le code de retour est conserve : sans lui, un echec de localisation etait
+    // impossible a distinguer d'une carte sans liaison PCIe.
+    public static string Cr(int code)
+    {
+        return "0x" + code.ToString("X8", CultureInfo.InvariantCulture);
+    }
+
+    // cr = -1 quand WMI n'a fourni aucun identifiant ; sinon le code cfgmgr32.
+    static uint Locate(string instanceId, out int cr)
     {
         uint di;
+        cr = -1;
         if (instanceId == null || instanceId.Length == 0) return 0;
-        if (CM_Locate_DevNodeW(out di, instanceId, 0) != CR_SUCCESS) return 0;
+        cr = CM_Locate_DevNodeW(out di, instanceId, 0);
+        if (cr != CR_SUCCESS) return 0;
         return di;
+    }
+
+    // Plan B : CM_Locate_DevNodeW peut rejeter l'identifiant renvoye par WMI
+    // (echappements differents, peripherique masque). On cherche alors une
+    // correspondance dans le parcours complet du bus.
+    static PcieLink FindByInstanceId(string instanceId, out string chain)
+    {
+        chain = "";
+        List<PcieLink> all = Scan();
+        PcieLink prefixe = null;
+        foreach (PcieLink l in all)
+        {
+            if (string.Equals(l.InstanceId, instanceId, StringComparison.OrdinalIgnoreCase))
+                return l;
+            if (prefixe == null && l.InstanceId != null &&
+                l.InstanceId.StartsWith(instanceId, StringComparison.OrdinalIgnoreCase))
+                prefixe = l;
+        }
+        if (prefixe != null)
+        {
+            chain = "identifiant rapproche : " + prefixe.InstanceId;
+            return prefixe;
+        }
+        return null;
     }
 
     static PcieLink Make(uint devInst)
@@ -248,25 +307,46 @@ public static class Pcie
         return list;
     }
 
-    // Remonte la hierarchie PnP a la recherche d'un pont PCIe parent.
+    // Remonte la hierarchie PnP jusqu'a un peripherique exposant des proprietes
+    // de liaison PCIe. Une carte graphique est un ENDPOINT PCIe : c'est elle qui
+    // publie CurrentLinkSpeed/CurrentLinkWidth, il ne faut donc pas ignorer le
+    // premier noeud (erreur corrigee ici : le test i > 0 faisait remonter jusqu'au
+    // pont racine, qui n'expose aucune de ces proprietes, d'ou "non reliee en PCIe").
     public static PcieLink FindUpChain(string instanceId, out string chain)
     {
         chain = "";
-        uint di = Locate(instanceId);
-        if (di == 0) return null;
+        int cr;
+        uint di = Locate(instanceId, out cr);
+        if (di == 0)
+        {
+            PcieLink alt = FindByInstanceId(instanceId, out chain);
+            if (alt == null)
+            {
+                if (cr == -1)
+                    chain = "WMI n'a fourni aucun identifiant PnP pour cette carte.";
+                else
+                    chain = "CM_Locate_DevNodeW a echoue (code " + Cr(cr) + ") et " +
+                            "l'identifiant n'a ete trouve nulle part sur le bus.";
+                return null;
+            }
+            if (alt.HasLink) return alt;
+            di = alt.DevInst;
+        }
         StringBuilder sb = new StringBuilder();
         for (int i = 0; i < 12; i++)
         {
             PcieLink l = Make(di);
             if (sb.Length > 0) sb.Append(" -> ");
             sb.Append(l.Name);
-            if (i > 0 && l.HasLink) { chain = sb.ToString(); return l; }
+            if (l.HasLink) { chain = sb.ToString(); return l; }
             uint parent;
             if (CM_Get_Parent(out parent, di, 0) != CR_SUCCESS) break;
             if (parent == di) break;
             di = parent;
         }
         chain = sb.ToString();
+        if (chain.Length == 0)
+            chain = "Aucun peripherique accessible au-dessus de cette carte.";
         return null;
     }
 }
@@ -363,13 +443,18 @@ public static class Gpus
             // l'utilisateur deviner s'il s'agit d'une panne ou d'un cas normal.
             if (g.Link == null)
             {
-                if (g.Chain.Length == 0)
-                    g.Error = "Peripherique introuvable dans l'arborescence PnP (identifiant " +
-                              (g.PnpId.Length > 0 ? g.PnpId : "non renseigne par WMI") + ").";
-                else if (g.IsHardware)
-                    g.Error = "Aucun pont PCI Express au-dessus de ce peripherique : la carte n'est " +
-                              "pas reliee par un bus PCIe (GPU integree au SoC). Les debits PCIe ne " +
-                              "sont pas applicables ; utilisez la mesure des transferts.";
+                if (g.PnpId.Length == 0)
+                    g.Error = "WMI ne fournit pas l'identifiant du peripherique : rapprochement PCIe impossible.";
+                else if (g.PnpId.StartsWith("SWD\\", StringComparison.OrdinalIgnoreCase))
+                    g.Error = "Pilote d'affichage logiciel : aucune carte physique derriere ce nom.";
+                else if (g.Chain.Length == 0)
+                    g.Error = "Peripherique introuvable dans l'arborescence PnP (identifiant " + g.PnpId + ").";
+                else if (g.PnpId.StartsWith("PCI\\", StringComparison.OrdinalIgnoreCase))
+                    g.Error = "Carte PCI detectee mais aucune liaison PCIe lisible : " + g.Chain;
+                else
+                    g.Error = "Aucune liaison PCI Express au-dessus de ce peripherique (GPU du SoC ou " +
+                              "plateforme sans bus PCIe visible). Les debits PCIe ne sont pas applicables ; " +
+                              "utilisez la mesure des transferts.";
             }
 
             if (g.Name.Length == 0) g.Name = "(nom illisible) " + g.DeviceId;
@@ -589,11 +674,13 @@ public static class GpuBench
         return r;
     }
 
-    public static double MemcpyGBs(int bytes, int reps)
+    static BenchRow MemcpyRow(int bytes, int reps, string note)
     {
-        if (src == IntPtr.Zero) return 0;
+        BenchRow r = new BenchRow();
+        r.Test = "Reference CPU (memcpy)";
+        if (src == IntPtr.Zero) { r.Ok = false; r.Note = "memoire de reference indisponible"; return r; }
         double[] t = Times(reps, delegate () { CopyMemory(dst, src, (UIntPtr)bytes); });
-        return Gb(bytes, t[t.Length / 2]);
+        return Row("Reference CPU (memcpy)", t, bytes, note);
     }
 
     public static List<BenchRow> Measure(int reps)
@@ -655,12 +742,8 @@ public static class GpuBench
             rows.Add(r);
         }
 
-        double refGb = MemcpyGBs(bytes, reps);
-        BenchRow cpu = new BenchRow();
-        cpu.Test = "Reference CPU (memcpy)";
-        cpu.Ok = refGb > 0;
-        cpu.GBs = refGb;
-        cpu.Note = "RtlMoveMemory " + (bytes / 1048576).ToString(CultureInfo.InvariantCulture) + " Mo";
+        BenchRow cpu = MemcpyRow(bytes, reps, "RtlMoveMemory " + (bytes / 1048576).ToString(CultureInfo.InvariantCulture) + " Mo");
+        double refGb = cpu.GBs;
         rows.Add(cpu);
 
         if (d2d.Ok && refGb > 0 && d2d.GBs > refGb * 2.5)
@@ -799,8 +882,30 @@ public static class SelfTest
         o.AppendLine("=== Historique ===");
         foreach (HistEntry e in History.Snapshot())
             o.AppendLine("  " + e.T.ToString("HH:mm:ss", CultureInfo.InvariantCulture) + " " + e.Kind + " " + e.Device + " " + e.Detail + " " + e.Value);
-        o.Append("done");
-        return o.ToString();
+        o.AppendLine("done");
+        string txt = o.ToString();
+        // Le meme rapport est ecrit dans un fichier : plus simple pour decrire un probleme
+        // sur une machine distante (le texte tient dans un fichier, pas dans une capture d'ecran).
+        // Trois dossiers sont tries, du plus pratique au plus permissif.
+        string nom = "SelfTest-" + DateTime.Now.ToString("yyyyMMdd-HHmmss", CultureInfo.InvariantCulture) + ".txt";
+        string[] dossiers = new string[3];
+        try { dossiers[0] = Path.GetDirectoryName(Process.GetCurrentProcess().MainModule.FileName); }
+        catch (Exception) { dossiers[0] = null; }
+        try { dossiers[1] = Directory.GetCurrentDirectory(); } catch (Exception) { dossiers[1] = null; }
+        try { dossiers[2] = Path.GetTempPath(); } catch (Exception) { dossiers[2] = null; }
+        for (int i = 0; i < dossiers.Length; i++)
+        {
+            if (dossiers[i] == null || dossiers[i].Length == 0) continue;
+            try
+            {
+                string p = Path.Combine(dossiers[i], nom);
+                File.WriteAllText(p, txt, new UTF8Encoding(false));
+                txt += "Rapport sauvegarde : " + p + Environment.NewLine;
+                break;
+            }
+            catch (Exception ex) { txt += "Pas de rapport dans " + dossiers[i] + " : " + ex.Message + Environment.NewLine; }
+        }
+        return txt;
     }
 }
 
@@ -861,6 +966,7 @@ public sealed class MainForm : Form
             new string[] { "Pilote", "110" },
             new string[] { "Editeur du pilote", "170" },
             new string[] { "Definition ecran", "110" },
+            new string[] { "Diagnostic", "300" },
             new string[] { "Identifiant du peripherique", "330" } });
 
         Panel bar = new Panel();
@@ -910,19 +1016,7 @@ public sealed class MainForm : Form
         txtNote.ScrollBars = ScrollBars.Vertical;
         txtNote.BackColor = SystemColors.Control;
         txtNote.Font = new Font("Segoe UI", 9f);
-        txtNote.Text =
-            "Lecture de la liaison PCIe :\r\n" +
-            "  Windows expose la vitesse et la largeur de liaison (DEVPKEY_PciDevice_CurrentLinkSpeed/Width) pour\r\n" +
-            "  tout peripherique connecte sur un bus PCI Express. La carte graphique de cette machine n'est pas un\r\n" +
-            "  peripherique PCI : elle est integree au SoC (peripherique ACPI), donc aucune largeur x1/x4/x8/x16\r\n" +
-            "  n'existe pour elle. La colonne \u00ab Liaison PCIe \u00bb affiche la premiere liaison PCIe trouvee en remontant\r\n" +
-            "  la hierarchie du peripherique ; \u00ab non reliee en PCIe \u00bb signifie qu'aucune n'existe.\r\n" +
-            "\r\n" +
-            "Mesure du debit reel :\r\n" +
-            "  Copie de tampons via Direct3D 11 (sans DXGI, appels directs dans la table de fonctions du pilote).\r\n" +
-            "  H2D = CPU vers GPU, D2H = GPU vers CPU, D2D = GPU vers GPU. Le debit de reference memcpy du CPU\r\n" +
-            "  permet de detecter les copies elidees par le pilote (valeur > 2,5x le memcpy = non mesurable).\r\n" +
-            "  Ces chiffres refletent la bande passante memoire du SoC quand le GPU n'est pas sur un bus PCIe distinct.";
+        UpdateNote();
 
         pGpu.Controls.Add(txtNote);
         pGpu.Controls.Add(lvBench);
@@ -1030,14 +1124,69 @@ public sealed class MainForm : Form
         lvGpu.Items.Clear();
         foreach (GpuInfo g in gpus)
         {
-            string link = g.Link == null ? "non reliee en PCIe" : g.Link.LinkText();
+            string link;
+            if (g.Link != null) link = g.Link.LinkText();
+            else if (g.PnpId.StartsWith("SWD", StringComparison.OrdinalIgnoreCase)) link = "pilote logiciel (carte absente)";
+            else if (g.PnpId.StartsWith("ACPI", StringComparison.OrdinalIgnoreCase)) link = "non reliee en PCIe (GPU du SoC)";
+            else link = "non reliee en PCIe";
             string cur = g.Link == null ? "-" : g.Link.CurrentGBs().ToString("0.00", CultureInfo.InvariantCulture);
             string mx = g.Link == null ? "-" : g.Link.MaxGBs().ToString("0.00", CultureInfo.InvariantCulture);
+            string diag = g.Error.Length > 0 ? g.Error : g.Chain;
             lvGpu.Items.Add(new ListViewItem(new string[] {
                 g.Name, link, cur, mx,
                 g.VramText(),
-                g.DriverVersion, g.Compat, g.Resolution, g.PnpId }));
+                g.DriverVersion, g.Compat, g.Resolution, diag, g.PnpId }));
         }
+        UpdateNote();
+    }
+
+    // Le texte d'explication depend du resultat reel de l'enumeration : il est
+    // redige apres chaque rafraichissement, jamais a la construction de la fenetre.
+    void UpdateNote()
+    {
+        bool anyLink = false, anyHardware = false;
+        if (gpus != null)
+        {
+            foreach (GpuInfo g in gpus)
+            {
+                if (g.IsHardware) anyHardware = true;
+                if (g.Link != null && g.Link.HasLink) anyLink = true;
+            }
+        }
+
+        StringBuilder sb = new StringBuilder();
+        sb.AppendLine("LECTURE DE LA LIAISON PCI EXPRESS");
+        sb.AppendLine();
+        sb.AppendLine("Windows publie, pour tout peripherique PCI Express, les proprietes DEVPKEY_PciDevice_CurrentLinkSpeed et CurrentLinkWidth : la generation et le nombre de voies reellement negocies par le bus. La colonne \u00ab Liaison PCIe \u00bb affiche la premiere liaison trouvee pour la carte, soit son propre endpoint sur le bus, soit le port situe en amont. La colonne \u00ab Diagnostic \u00bb indique ce qui a ete trouve, ou l'etape qui a echoue.");
+        sb.AppendLine();
+        if (gpus == null)
+        {
+            sb.AppendLine("Enumeration en cours...");
+        }
+        else if (anyLink)
+        {
+            sb.AppendLine("Les cartes listees ci-dessus sont bien reliees a un port PCI Express : generation, largeur et debit theorique refletent la negociation reelle du bus. Une carte peut negocier moins que son maximum (emplacement du slot, carte mechaniquement limitee, economie d'energie) : comparez \u00ab Liaison PCIe \u00bb et \u00ab Debit max \u00bb, et consultez l'onglet \u00ab Historique \u00bb pour voir les changements de liaison.");
+        }
+        else if (anyHardware)
+        {
+            sb.AppendLine("Aucune liaison PCI Express lisible n'a ete trouvee pour les cartes listees. Lisez la colonne \u00ab Diagnostic \u00bb : soit Windows n'expose pas les proprietes PCIe de ce peripherique, soit la carte est vue a travers un pilote d'affichage indirect. L'onglet \u00ab Liaisons PCIe \u00bb liste toutes les liaisons que la machine publie : si la carte n'y apparait pas, c'est que Windows ne la rattache pas a un bus PCI.");
+        }
+        else
+        {
+            sb.AppendLine("Aucune carte graphique materielle n'a ete enumeree par WMI sur cette machine.");
+        }
+        sb.AppendLine();
+        sb.AppendLine();
+        sb.AppendLine("MESURE DU DEBIT REEL (Direct3D 11)");
+        sb.AppendLine();
+        sb.AppendLine("Le bouton \u00ab Mesurer les debits \u00bb chronometre trois copies d'une texture, cote GPU et cote CPU :");
+        sb.AppendLine("  H2D : memoire systeme vers memoire de la carte (UpdateSubresource)");
+        sb.AppendLine("  D2H : memoire de la carte vers memoire systeme (Map sur une texture STAGING)");
+        sb.AppendLine("  D2D : copie GPU interne (CopyResource entre deux textures par defaut)");
+        sb.AppendLine("La ligne \u00ab Reference CPU (memcpy) \u00bb sert de garde-fou : une mesure GPU superieure a plus de 2,5 fois ce reference signalerait une copie elidee par le pilote, donc non mesurable.");
+        sb.AppendLine("Ces chiffres mesurent le chemin GPU<->systeme (le lien PCIe pour une carte discrete), pas la bande passante de la memoire video interne, qui necessiterait CUDA ou OpenCL.");
+        sb.AppendLine("La mesure utilise l'adaptateur Direct3D par defaut de la session : sur une machine multi-cartes, elle ne concerne pas necessairement la carte affichee en premiere ligne.");
+        txtNote.Text = sb.ToString();
     }
 
     public void RefreshPcie(bool full)
@@ -1142,11 +1291,17 @@ public sealed class MainForm : Form
                     History.RecordMeasure("GPU (materiel)",
                         mb.ToString(CultureInfo.InvariantCulture) + " Mo : aucune mesure exploitable", "");
                 SyncHistoryView();
+                lblBenchInfo.Text = "Mesure terminee a "
+                    + DateTime.Now.ToString("HH:mm:ss", CultureInfo.InvariantCulture)
+                    + " : " + done.Count.ToString(CultureInfo.InvariantCulture)
+                    + " ligne(s) exploitable(s) sur " + mb.ToString(CultureInfo.InvariantCulture)
+                    + " Mo. " + GpuBench.Status;
             }
         }
         catch (Exception ex)
         {
             lvBench.Items.Add(new ListViewItem(new string[] { "Exception", "-", "-", "-", "-", ex.Message }));
+            lblBenchInfo.Text = "Erreur pendant la mesure : " + ex.Message;
         }
         finally
         {
@@ -1158,8 +1313,18 @@ public sealed class MainForm : Form
 public static class Program
 {
     [STAThread]
-    public static void Main()
+    public static void Main(string[] args)
     {
+        // GpuMonitor.exe -SelfTest : verifie le moteur sans fenetre et ecrit un
+        // rapport SelfTest-<date>.txt a cote de l'executable (ou dans %TEMP%).
+        if (args != null && args.Length > 0 &&
+            (string.Equals(args[0], "-SelfTest", StringComparison.OrdinalIgnoreCase) ||
+             string.Equals(args[0], "/SelfTest", StringComparison.OrdinalIgnoreCase)))
+        {
+            SelfTest.Run();
+            return;
+        }
+
         Application.EnableVisualStyles();
         Application.SetCompatibleTextRenderingDefault(false);
         Application.Run(new MainForm());

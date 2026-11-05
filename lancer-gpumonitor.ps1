@@ -1,6 +1,8 @@
 # Lance le moniteur GPU / PCIe.
-# L'app est compilee EN MEMOIRE (Add-Type) car les .exe crees sur cette machine
-# sont bloques par la strategie de controle des applications.
+# Voie de secours : l'app est compilee EN MEMOIRE (Add-Type), aucun .exe n'est
+# ecrit sur le disque. Utile si GpuMonitor.exe est bloque (AppLocker / WDAC /
+# SmartScreen) ou si l'on ne veut pas compiler. En temps normal, preferez
+# GpuMonitor.exe (ou GpuMonitor.cmd).
 # Parametre optionnel : -SelfTest  (verifie les moteurs sans ouvrir la fenetre)
 
 param([switch]$SelfTest)
@@ -23,5 +25,6 @@ if ($SelfTest) {
     [SelfTest]::Run()
 } else {
     Write-Host 'Ouverture de la fenetre.' -ForegroundColor Green
-    [Program]::Main()
+    # Main attend un tableau de parametres : on lui passe un tableau vide.
+    [Program]::Main([string[]]@())
 }

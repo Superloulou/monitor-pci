@@ -1,6 +1,8 @@
 <#
-    lancer-sans-exe.ps1 - Alternative quand le .exe est bloque
-    (strategie de securite type AppLocker / WDAC / SmartScreen).
+    lancer-sans-exe.ps1 - Voie de secours : le code est compile EN MEMOIRE
+    (Add-Type), aucun .exe n'est ecrit sur le disque. Utile si GpuMonitor.exe
+    est bloque (AppLocker / WDAC / SmartScreen) ou si l'on ne veut pas compiler.
+    En temps normal, preferez GpuMonitor.exe (ou GpuMonitor.cmd).
 
     Le programme est compile EN MEMOIRE par PowerShell : aucun fichier
     .exe n'est cree sur le disque.
@@ -23,4 +25,9 @@ Write-Host 'Compilation en memoire (3 a 6 secondes)...'
 Add-Type -TypeDefinition (Get-Content -LiteralPath $src -Raw) `
     -ReferencedAssemblies System.dll,System.Core.dll,System.Windows.Forms.dll,System.Drawing.dll,System.Management.dll
 
-if ($SelfTest) { [SelfTest]::Run() } else { [Program]::Main() }
+if ($SelfTest) {
+    [SelfTest]::Run()
+} else {
+    # Main attend un string[] : on lui passe un tableau de chaines vide.
+    [Program]::Main([string[]]@())
+}
