@@ -41,7 +41,13 @@ Trois onglets :
 
 3. INSTALLATION (30 secondes)
 ---------------------------------------------------------------------
-  1. Copier le dossier "GpuMonitor" ou il vous veut bien, par exemple :
+  Telechargement : le package est dans le depot, dossier "dist" :
+      dist\GpuMonitor-Windows11.zip
+  Lien direct :
+      https://github.com/Superloulou/monitor-pci/raw/main/dist/GpuMonitor-Windows11.zip
+
+  1. Decompresser le zip ou vous le souhaitez, puis copier le dossier
+     "GpuMonitor" ou il vous plait, par exemple :
          C:\Tools\GpuMonitor
      (sur le serveur IA : meme chose ; le programme n'a pas besoin
       d'etre installe, il n'ecrit rien dans le registre ni ailleurs)
@@ -77,6 +83,8 @@ fichier ailleurs.
                           utiliser si la securite de la machine bloque
                           les executables non signes.
   README.txt              Ce fichier.
+  (Le package complet est distribue sous forme d'archive :
+   GpuMonitor-Windows11.zip, dans le dossier "dist" du depot GitHub.)
 
 
 6. SI LE .EXE EST BLOQUE PAR LA SECURITE DE LA MACHINE

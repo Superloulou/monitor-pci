@@ -8,6 +8,20 @@ Un seul fichier C#, aucune dépendance, aucun installateur, aucun droit administ
 
 ---
 
+## Téléchargement
+
+Package prêt à déployer sur n'importe quel PC Windows 11 (x64 ou ARM64) :
+
+**[GpuMonitor-Windows11.zip](./dist/GpuMonitor-Windows11.zip)** — 39 Ko, tag [`v1.1`](../../releases/tag/v1.1)
+
+Lien direct : <https://github.com/Superloulou/monitor-pci/raw/main/dist/GpuMonitor-Windows11.zip>
+
+Décompresser le zip dans un dossier, puis double-cliquer sur `GpuMonitor.cmd`. Détail du
+contenu et cas particuliers (SmartScreen, session RDP, GPU intégré) dans le [README.txt](./README.txt)
+livré dans le package.
+
+---
+
 ## Les trois onglets
 
 | Onglet | Contenu |
@@ -42,6 +56,7 @@ Windows s'il n'est pas encore présent, puis ouvre la fenêtre.
 | `lancer-gpumonitor.ps1` / `.cmd` | Même méthode « sans .exe », côté développeur. |
 | `GpuMonitor.cs` | Le code source complet (un seul fichier). |
 | `README.txt` | Le mode d'emploi livré dans le package (même contenu que ce fichier). |
+| `dist/GpuMonitor-Windows11.zip` | Archive prête à télécharger (le package complet, exe inclus). |
 | `probes/` | Sondes de diagnostic décrites plus bas. |
 
 Test sans interface graphique (pratique à distance, sur un serveur) :

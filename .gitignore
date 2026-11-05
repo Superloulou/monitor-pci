@@ -4,3 +4,6 @@
 *.pdb
 bin/
 obj/
+
+# Archive prete a telecharger (package de deploiement Windows 11)
+!dist/*.zip
