@@ -5,7 +5,7 @@
 
 1. CE QUE FAIT LE PROGRAMME
 ---------------------------------------------------------------------
-Trois onglets :
+Quatre onglets :
 
   * Cartes graphiques
       Liste chaque carte video detectee (nom, fabricant, memoire
@@ -22,6 +22,12 @@ Trois onglets :
       Express de la machine (cartes video, SSD NVMe, reseau WiFi,
       etc.) avec generation, largeur, debit actuel et debit maximal.
 
+  * Debit PCIe en direct
+      Graphe temps reel du trafic PCIe REELLEMENT MESURE PAR LE
+      PILOTE NVIDIA (une courbe par carte graphique). Aucune mesure
+      manuelle : le programme lit les compteurs du pilote via
+      "nvidia-smi dmon -s t". Voir le point 8 bis.
+
   * Historique
       Trace de chaque changement de liaison (ex : la carte est
       passee de x8 a x16) et de chaque mesure de transfert.
@@ -37,6 +43,9 @@ Trois onglets :
   * Droits administrateur : NON requis
   * Aucune dependance, aucun fichier supplementaire, pas de connexion
     Internet
+  * Pour l'onglet "Debit PCIe en direct" uniquement : pilote NVIDIA
+    installe (la commande nvidia-smi est livree avec le pilote). Sur un
+    PC sans GPU NVIDIA, les trois autres onglets fonctionnent normalement.
 
 
 3. INSTALLATION (30 secondes)
@@ -103,8 +112,9 @@ disque. Compilation : 3 a 6 secondes.
 ---------------------------------------------------------------------
     powershell -NoProfile -ExecutionPolicy Bypass -STA -File "C:\Tools\GpuMonitor\lancer-sans-exe.ps1" -SelfTest
 
-Affiche le resultat des trois moteurs (PCIe, cartes graphiques, mesures
-de transfert) dans la console. Pratique pour verifier a distance.
+Affiche le resultat des quatre moteurs (PCIe, cartes graphiques, mesures
+de transfert, trafic PCIe NVIDIA) dans la console. Pratique pour
+verifier a distance.
 
 
 8. COMMENT LIRE LES RESULTATS
@@ -143,6 +153,44 @@ de transfert) dans la console. Pratique pour verifier a distance.
     saturation.
 
 
+8 bis. ONGLET "DEBIT PCIe EN DIRECT" (valeurs mesurees par le pilote)
+---------------------------------------------------------------------
+  * Cet onglet ne mesure rien lui-meme : il lit les compteurs du pilote
+    NVIDIA via "nvidia-smi dmon -s t". Ce sont les valeurs reellement
+    mesurees sur la liaison, pendant que vos programmes tournent.
+
+  * rx.pci = trafic vers la carte (chargement des poids d'un modele,
+    affichage). tx.pci = trafic depuis la carte. La courbe affiche le
+    plus fort des deux a chaque instant, en Go/s.
+
+  * Une courbe par carte graphique, rafraichie chaque seconde. Choix de
+    la fenetre affichee : 1 min, 5 min, 15 min (par defaut), 30 min,
+    1 h. Bouton "Effacer le graphe" pour repartir de zero avant une
+    mesure.
+
+  * La mesure demarre seule des que le programme detecte un pilote
+    NVIDIA. Sur un PC sans GPU NVIDIA, l'onglet reste vide et le
+    message "nvidia-smi introuvable" s'affiche.
+
+  * Ligne horizontale grise = plafond theorique de la liaison PCIe la
+    plus rapide du PC (debit calcule a partir de la generation et du
+    nombre de lignes negocies). Elle n'apparait que si le trafic
+    mesure est du meme ordre de grandeur. Si la courbe reste tres en
+    dessous, la liaison n'est pas saturee : c'est le logiciel, pas le
+    bus, qui limite.
+
+  * Verifier d'abord la liaison negocee (onglet "Liaisons PCIe") : une
+    carte Gen4 x8 ne peut pas depasser 14,67 Go/s, alors qu'en x16 elle
+    pourrait atteindre 29,34 Go/s. Une carte montee en x4 sur un slot
+    prevu pour x16 perd un facteur 4 avant toute logique logicielle.
+
+  * L'onglet "Cartes graphiques" (mesure Direct3D 11) reste une valeur
+    plancher : Direct3D 11 n'offre pas de memoire pincee, les donnees
+    sont copiees deux fois et le chronometre s'arrete des que la copie
+    est confiee au pilote. L'onglet "Debit PCIe en direct" est la
+    mesure de reference.
+
+
 9. NOTES TECHNIQUES
 ---------------------------------------------------------------------
   * Lecture des liaisons PCIe : API Configuration Manager (cfgmgr32) +
@@ -151,6 +199,13 @@ de transfert) dans la console. Pratique pour verifier a distance.
   * Liste des cartes : WMI (Win32_VideoController).
   * Mesures de transfert : Direct3D 11 (DirectCompute / textures
     intermediaires staging), sans dependance externe.
+  * Trafic PCIe en direct : le programme lit la sortie de la commande
+    "nvidia-smi dmon -s t" (livree avec le pilote NVIDIA) dans un
+    processus fils. Il ne fabrique aucune valeur : ce sont les compteurs
+    du pilote.
+  * Graphe : assembly System.Windows.Forms.DataVisualization, fourni avec
+    .NET Framework 4.8. Aucune DLL supplementaire n'est ajoutee au
+    package.
   * Le programme est en lecture seule : il ne modifie aucun
     peripherique, aucun pilote, aucun registre.
   * Code source : un seul fichier C# (GpuMonitor.cs), compile avec le

@@ -19,7 +19,8 @@ Write-Host 'Compilation en memoire (quelques secondes)...' -ForegroundColor Cyan
 
 Add-Type -TypeDefinition (Get-Content -LiteralPath $src -Raw) `
     -ReferencedAssemblies System.dll, System.Core.dll, System.Windows.Forms.dll, `
-                          System.Drawing.dll, System.Management.dll
+                          System.Drawing.dll, System.Management.dll, `
+                          System.Windows.Forms.DataVisualization.dll
 
 if ($SelfTest) {
     [SelfTest]::Run()

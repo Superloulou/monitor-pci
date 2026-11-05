@@ -23,7 +23,7 @@ if (-not (Test-Path -LiteralPath $src)) {
 
 Write-Host 'Compilation en memoire (3 a 6 secondes)...'
 Add-Type -TypeDefinition (Get-Content -LiteralPath $src -Raw) `
-    -ReferencedAssemblies System.dll,System.Core.dll,System.Windows.Forms.dll,System.Drawing.dll,System.Management.dll
+    -ReferencedAssemblies System.dll,System.Core.dll,System.Windows.Forms.dll,System.Drawing.dll,System.Management.dll,System.Windows.Forms.DataVisualization.dll
 
 if ($SelfTest) {
     [SelfTest]::Run()

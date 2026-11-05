@@ -17,6 +17,7 @@ using System.Management;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Windows.Forms;
+using System.Windows.Forms.DataVisualization.Charting;
 
 // ============================================================================
 //  1. LIAISON PCIe : proprietes PnP (cfgmgr32)
@@ -834,7 +835,378 @@ public static class History
 }
 
 // ============================================================================
-//  5. AUTO-TEST (verifie le moteur sans interface, via Add-Type)
+//  5. TRAFIC PCIe REEL MESURE PAR LE PILOTE NVIDIA (nvidia-smi dmon -s t)
+//
+//  Le banc D3D11 mesure ce que le programme envoie ; lui ne mesure pas ce que
+//  la carte recoit vraiment. Le pilote NVIDIA, lui, connait le nombre d'octets
+//  qui ont effectivement traverse le lien PCIe. La commande
+//      nvidia-smi dmon -s t
+//  affiche chaque seconde, par carte, rx pci et tx pci. C'est la valeur reelle.
+// ============================================================================
+public sealed class NvSample
+{
+    public DateTime T;
+    public int Index;
+    public double Rx, Tx;      // Go/s
+}
+
+public sealed class NvGpu
+{
+    public int Index = -1;
+    public string Name = "";
+    public string Bus = "";
+    public double LastRx, LastTx, MaxRx, MaxTx, SumRx, SumTx;
+    public long Count;
+    public bool Seen;
+}
+
+public sealed class NvTraffic
+{
+    readonly object gate = new object();
+    readonly List<NvGpu> gpus = new List<NvGpu>();
+    readonly List<NvSample> samples = new List<NvSample>();
+
+    Process proc;
+    System.Threading.Thread reader;
+    string smiPath = "";
+    string status = "non demarre";
+    bool running;
+    int skipHeader;
+    int rxCol = -1, txCol = -1;
+    bool unitIsGb;
+    long lastLineTicks;
+
+    public string Status { get { lock (gate) return status; } }
+    public bool IsRunning { get { lock (gate) return running; } }
+    public long LastLineMs
+    {
+        get
+        {
+            lock (gate)
+            {
+                if (lastLineTicks == 0) return -1;
+                return (DateTime.Now.Ticks - lastLineTicks) / TimeSpan.TicksPerMillisecond;
+            }
+        }
+    }
+
+    public List<NvGpu> Gpus()
+    {
+        lock (gate) return new List<NvGpu>(gpus);
+    }
+
+    public List<NvSample> Samples(int max)
+    {
+        lock (gate)
+        {
+            int n = samples.Count;
+            if (n <= max) return new List<NvSample>(samples);
+            return new List<NvSample>(samples.GetRange(n - max, max));
+        }
+    }
+
+    public int SampleCount() { lock (gate) return samples.Count; }
+
+    public void Clear()
+    {
+        lock (gate)
+        {
+            samples.Clear();
+            foreach (NvGpu g in gpus) { g.MaxRx = 0; g.MaxTx = 0; g.SumRx = 0; g.SumTx = 0; g.Count = 0; }
+        }
+    }
+
+    // -------------------------------------------------------------------
+    //  Localisation de nvidia-smi
+    // -------------------------------------------------------------------
+    public static string FindSmi()
+    {
+        string[] fixed_ = new string[3];
+        fixed_[0] = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), "nvidia-smi.exe");
+        fixed_[1] = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),
+                                 @"NVIDIA Corporation\NVSMI\nvidia-smi.exe");
+        fixed_[2] = "nvidia-smi.exe";
+        foreach (string p in fixed_)
+        {
+            try { if (File.Exists(p)) return p; }
+            catch (Exception) { }
+        }
+        // PATH
+        string path = Environment.GetEnvironmentVariable("PATH") ?? "";
+        foreach (string d in path.Split(';'))
+        {
+            if (d.Trim().Length == 0) continue;
+            try
+            {
+                string p = Path.Combine(d.Trim(), "nvidia-smi.exe");
+                if (File.Exists(p)) return p;
+            }
+            catch (Exception) { }
+        }
+        return null;
+    }
+
+    // -------------------------------------------------------------------
+    //  Demarrage / arret
+    // -------------------------------------------------------------------
+    public void Start()
+    {
+        string smi = FindSmi();
+        if (smi == null)
+        {
+            lock (gate) status = "nvidia-smi introuvable : aucun pilote NVIDIA detecte sur ce PC";
+            return;
+        }
+        smiPath = smi;
+        QueryGpus();
+        lock (gate)
+        {
+            if (running) return;
+            running = true;
+        }
+        try
+        {
+            ProcessStartInfo si = new ProcessStartInfo();
+            si.FileName = smi;
+            si.Arguments = "dmon -s t";
+            si.UseShellExecute = false;
+            si.CreateNoWindow = true;
+            si.RedirectStandardOutput = true;
+            si.RedirectStandardError = true;
+            si.StandardOutputEncoding = Encoding.UTF8;
+            proc = Process.Start(si);
+            reader = new System.Threading.Thread(ReadLoop);
+            reader.IsBackground = true;
+            reader.Start();
+
+            System.Threading.Thread err = new System.Threading.Thread(ReadErr);
+            err.IsBackground = true;
+            err.Start();
+            lock (gate) status = "capture en cours : " + smi + " dmon -s t";
+        }
+        catch (Exception ex)
+        {
+            lock (gate)
+            {
+                running = false;
+                status = "demarrage impossible : " + ex.Message;
+            }
+        }
+    }
+
+    public void Stop()
+    {
+        lock (gate) running = false;
+        try { if (proc != null && !proc.HasExited) proc.Kill(); }
+        catch (Exception) { }
+    }
+
+    void ReadErr()
+    {
+        try
+        {
+            if (proc == null) return;
+            string err = proc.StandardError.ReadToEnd();
+            if (err != null && err.Trim().Length > 0)
+                lock (gate) status = "nvidia-smi : " + err.Trim().Replace("\r\n", " ");
+        }
+        catch (Exception) { }
+    }
+
+    void ReadLoop()
+    {
+        try
+        {
+            StreamReader sr = proc.StandardOutput;
+            string line;
+            while ((line = sr.ReadLine()) != null)
+            {
+                HandleLine(line);
+                if (!running) break;
+            }
+        }
+        catch (Exception) { }
+        lock (gate) running = false;
+    }
+
+    // -------------------------------------------------------------------
+    //  Liste des cartes (index, nom, bus) : sert a nommer les courbes
+    // -------------------------------------------------------------------
+    void QueryGpus()
+    {
+        try
+        {
+            ProcessStartInfo si = new ProcessStartInfo();
+            si.FileName = smiPath;
+            si.Arguments = "--query-gpu=index,name,pci.bus_id --format=csv,noheader";
+            si.UseShellExecute = false;
+            si.CreateNoWindow = true;
+            si.RedirectStandardOutput = true;
+            si.StandardOutputEncoding = Encoding.UTF8;
+            Process p = Process.Start(si);
+            string o = p.StandardOutput.ReadToEnd();
+            p.WaitForExit(4000);
+            foreach (string raw in o.Split('\n'))
+            {
+                string line = raw.Trim();
+                if (line.Length == 0) continue;
+                string[] parts = line.Split(',');
+                if (parts.Length < 2) continue;
+                NvGpu g = new NvGpu();
+                g.Index = ParseInt(parts[0]);
+                g.Name = parts[1].Trim();
+                if (parts.Length > 2) g.Bus = parts[2].Trim();
+                lock (gate) gpus.Add(g);
+            }
+        }
+        catch (Exception) { }
+    }
+
+    // -------------------------------------------------------------------
+    //  Analyse d'une ligne de dmon
+    //
+    //  Exemple (le nombre et l'ordre des colonnes dependent du pilote) :
+    //      # gpu  pci    rx.pci   tx.pci   ...
+    //        0   0000:01:00.0   1234   567   ...
+    //  Les unites peuvent etre Mo/s ou GB/s selon la version.
+    // -------------------------------------------------------------------
+    void HandleLine(string raw)
+    {
+        if (raw == null) return;
+        string line = raw.Trim();
+        if (line.Length == 0) return;
+
+        if (line[0] == '#')
+        {
+            // En-tete : on repere ou se trouvent rx et tx.
+            string[] h = line.Split(new char[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries);
+            int hrx = -1, htx = -1;
+            for (int i = 0; i < h.Length; i++)
+            {
+                string c = h[i].ToLower(CultureInfo.InvariantCulture);
+                if (hrx < 0 && c.IndexOf("rx", StringComparison.Ordinal) >= 0 && c.IndexOf("pci", StringComparison.Ordinal) >= 0) hrx = i;
+                if (htx < 0 && c.IndexOf("tx", StringComparison.Ordinal) >= 0 && c.IndexOf("pci", StringComparison.Ordinal) >= 0) htx = i;
+            }
+            lock (gate)
+            {
+                if (hrx >= 0 && htx >= 0) { rxCol = hrx; txCol = htx; skipHeader = h.Length; }
+                unitIsGb = line.IndexOf("GB/s", StringComparison.OrdinalIgnoreCase) >= 0;
+            }
+            return;
+        }
+
+        string[] f = line.Split(new char[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries);
+        if (f.Length < 3) return;
+
+        int rxColL, txColL, skipL;
+        bool gb;
+        lock (gate) { rxColL = rxCol; txColL = txCol; skipL = skipHeader; gb = unitIsGb; }
+
+        int idx = ParseInt(f[0]);
+        if (idx < 0) return;
+
+        int rx = -1, tx = -1;
+        if (rxColL >= 0 && txColL >= 0 && f.Length == skipL)
+        {
+            rx = rxColL; tx = txColL;
+        }
+        else
+        {
+            // Plan B : on cherche deux nombres consecutifs apres le bus PCI.
+            // Dans « dmon -s t » il n'y a que ces deux-la.
+            int first = 1;
+            if (f.Length > 1 && f[1].IndexOf(':') >= 0) first = 2;
+            List<int> nums = new List<int>();
+            for (int i = first; i < f.Length && nums.Count < 2; i++)
+            {
+                double d;
+                if (double.TryParse(f[i], NumberStyles.Any, CultureInfo.InvariantCulture, out d)) nums.Add(i);
+            }
+            if (nums.Count < 2) return;
+            rx = nums[0]; tx = nums[1];
+        }
+
+        double rxv, txv;
+        if (!double.TryParse(f[rx], NumberStyles.Any, CultureInfo.InvariantCulture, out rxv)) return;
+        if (!double.TryParse(f[tx], NumberStyles.Any, CultureInfo.InvariantCulture, out txv)) return;
+
+        // Unite : « GB/s » dans l'en-tete, sinon Mo/s (le cas courant).
+        double k = 1.0 / 1024.0;
+        if (gb) k = 1.0;
+
+        NvSample s = new NvSample();
+        s.T = DateTime.Now;
+        s.Index = idx;
+        s.Rx = rxv * k;
+        s.Tx = txv * k;
+
+        lock (gate)
+        {
+            lastLineTicks = DateTime.Now.Ticks;
+            samples.Add(s);
+            if (samples.Count > 7200) samples.RemoveAt(0);
+            NvGpu g = FindGpu(idx);
+            g.LastRx = s.Rx; g.LastTx = s.Tx;
+            if (s.Rx > g.MaxRx) g.MaxRx = s.Rx;
+            if (s.Tx > g.MaxTx) g.MaxTx = s.Tx;
+            g.SumRx += s.Rx; g.SumTx += s.Tx; g.Count++;
+            g.Seen = true;
+        }
+    }
+
+    // Appelle sous verrou.
+    NvGpu FindGpu(int idx)
+    {
+        foreach (NvGpu g in gpus) if (g.Index == idx) return g;
+        NvGpu n = new NvGpu();
+        n.Index = idx;
+        n.Name = "GPU " + idx.ToString(CultureInfo.InvariantCulture);
+        gpus.Add(n);
+        return n;
+    }
+
+    static int ParseInt(string s)
+    {
+        int v;
+        if (int.TryParse(s.Trim(), NumberStyles.Any, CultureInfo.InvariantCulture, out v)) return v;
+        return -1;
+    }
+
+    // -------------------------------------------------------------------
+    //  Test du parseur (aucune carte NVIDIA n'est necessaire)
+    // -------------------------------------------------------------------
+    public static string SelfTestParser()
+    {
+        StringBuilder o = new StringBuilder();
+        string[] lines = new string[6];
+        lines[0] = "# gpu  pci      rx.pci   tx.pci   fb   cmd   sm   mem   enc   dec   mp   jpeg   ofa";
+        lines[1] = "# Index: PCI bus id ... rx.pci, tx.pci in MB/s";
+        lines[2] = "  0   00000000:01:00.0    1234     567   1234   12   10   20    0     0     0     0      0";
+        lines[3] = "  1   00000000:02:00.0       0       0    456    3    2    5    0     0     0     0      0";
+        lines[4] = "  2   00000000:03:00.0    3000    1500    789    8    4    9    0     0     0     0      0";
+        lines[5] = "  0   00000000:01:00.0    2048    1024   1234   12   10   20    0     0     0     0      0";
+        NvTraffic t = new NvTraffic();
+        foreach (string l in lines) t.HandleLine(l);
+        List<NvSample> ss = t.Samples(100);
+        o.AppendLine("  lignes analysees : " + ss.Count + " (attendu 4)");
+        foreach (NvGpu g in t.Gpus())
+            o.AppendLine("  GPU " + g.Index + " : rx " + g.LastRx.ToString("0.000", CultureInfo.InvariantCulture) +
+                         " Go/s, tx " + g.LastTx.ToString("0.000", CultureInfo.InvariantCulture) +
+                         " Go/s, max rx " + g.MaxRx.ToString("0.000", CultureInfo.InvariantCulture) +
+                         " (echantillons " + g.Count.ToString(CultureInfo.InvariantCulture) + ")");
+        bool ok = ss.Count == 4;
+        foreach (NvGpu g in t.Gpus())
+        {
+            if (g.Index == 0 && Math.Abs(g.MaxRx - 2.0) > 0.001) ok = false;
+            if (g.Index == 2 && Math.Abs(g.LastRx - 2.9296875) > 0.001) ok = false;
+        }
+        o.AppendLine("  parseur : " + (ok ? "OK" : "ECHEC"));
+        return o.ToString();
+    }
+}
+
+// ============================================================================
+//  6. AUTO-TEST (verifie le moteur sans interface, via Add-Type)
 // ============================================================================
 public static class SelfTest
 {
@@ -878,6 +1250,11 @@ public static class SelfTest
             }
         }
         else o.AppendLine("  " + GpuBench.Status);
+
+        o.AppendLine("=== Trafic PCIe NVIDIA ===");
+        string smi = NvTraffic.FindSmi();
+        o.AppendLine("  nvidia-smi : " + (smi == null ? "introuvable (pas de pilote NVIDIA sur ce PC)" : smi));
+        o.Append(NvTraffic.SelfTestParser());
 
         o.AppendLine("=== Historique ===");
         foreach (HistEntry e in History.Snapshot())
@@ -929,6 +1306,17 @@ public sealed class MainForm : Form
     Label lblBenchInfo = new Label();
     Label lblTheory = new Label();
     Timer timer = new Timer();
+    Chart chart = new Chart();
+    ListView lvNv = new ListView();
+    Label lblNvStatus = new Label();
+    Button btnNv = new Button();
+    ComboBox cmbNvWin = new ComboBox();
+    NvTraffic nv = new NvTraffic();
+    Dictionary<int, double> nvPeak = new Dictionary<int, double>();
+
+    static readonly Color[] NvColors = new Color[] {
+        Color.Red, Color.DodgerBlue, Color.Goldenrod, Color.SeaGreen,
+        Color.Magenta, Color.DarkCyan, Color.OrangeRed, Color.Gray };
 
     List<GpuInfo> gpus = new List<GpuInfo>();
     List<PcieLink> links = new List<PcieLink>();
@@ -938,15 +1326,19 @@ public sealed class MainForm : Form
         Text = "Moniteur GPU / PCIe - vitesse de transfert et historique des liaisons";
         Width = 1120;
         Height = 720;
+        // empeche la fenetre d'etre reduite au point d'ecraser le graphe (hauteur <= 0)
+        MinimumSize = new Size(820, 460);
         StartPosition = FormStartPosition.CenterScreen;
         try { Icon = SystemIcons.Application; } catch { }
 
         tabs.Dock = DockStyle.Fill;
         TabPage pGpu = new TabPage("Cartes graphiques");
         TabPage pPcie = new TabPage("Liaisons PCIe");
+        TabPage pNv = new TabPage("Debit PCIe en direct");
         TabPage pHist = new TabPage("Historique");
         tabs.TabPages.Add(pGpu);
         tabs.TabPages.Add(pPcie);
+        tabs.TabPages.Add(pNv);
         tabs.TabPages.Add(pHist);
         Controls.Add(tabs);
 
@@ -1066,7 +1458,76 @@ public sealed class MainForm : Form
         pPcie.Controls.Add(lblTheory);
         pPcie.Controls.Add(bar2);
 
-        // ---- onglet Historique ------------------------------------------
+        // ---- onglet debit PCIe en direct --------------------------------
+        // Le graphe est en Dock=Fill : il faut que l'onglet ait une taille
+        // suffisante AVANT l'ajout des controles anches, sinon la zone
+        // restante fait 0px (ou moins) et Chart rejette la hauteur.
+        pNv.Size = new Size(1080, 640);
+
+        Panel bar4 = new Panel();
+        bar4.Dock = DockStyle.Top;
+        bar4.Height = 34;
+        btnNv.Text = "Demarrer la mesure";
+        btnNv.SetBounds(8, 4, 150, 26);
+        btnNv.Click += OnNvToggle;
+        Label l4 = new Label();
+        l4.Text = "Fenetre :";
+        l4.SetBounds(170, 9, 50, 18);
+        cmbNvWin.SetBounds(222, 6, 90, 24);
+        cmbNvWin.DropDownStyle = ComboBoxStyle.DropDownList;
+        cmbNvWin.Items.AddRange(new object[] { "1 min", "5 min", "15 min", "30 min", "1 h" });
+        cmbNvWin.SelectedIndex = 2;
+        Button btnNvClear = new Button();
+        btnNvClear.Text = "Effacer le graphe";
+        btnNvClear.SetBounds(322, 4, 120, 26);
+        btnNvClear.Click += delegate { nv.Clear(); nvPeak.Clear(); RedrawChart(); };
+        lblNvStatus.Text = "Mesure du trafic PCIe en attente de demarrage.";
+        lblNvStatus.SetBounds(452, 9, 640, 18);
+        bar4.Controls.Add(btnNv);
+        bar4.Controls.Add(l4);
+        bar4.Controls.Add(cmbNvWin);
+        bar4.Controls.Add(btnNvClear);
+        bar4.Controls.Add(lblNvStatus);
+
+        lvNv.Dock = DockStyle.Bottom;
+        lvNv.Height = 150;
+        lvNv.View = View.Details;
+        lvNv.FullRowSelect = true;
+        AddCols(lvNv, new string[][] {
+            new string[] { "GPU", "60" },
+            new string[] { "Carte graphique", "260" },
+            new string[] { "Bus PCIe", "110" },
+            new string[] { "rx PCIe instantane (Go/s)", "150" },
+            new string[] { "tx PCIe instantane (Go/s)", "150" },
+            new string[] { "rx max (Go/s)", "110" },
+            new string[] { "tx max (Go/s)", "110" },
+            new string[] { "rx moyen (Go/s)", "120" },
+            new string[] { "tx moyen (Go/s)", "120" },
+            new string[] { "Echantillons", "90" } });
+
+        chart.Dock = DockStyle.Fill;
+        ChartArea area = new ChartArea("trafic");
+        area.AxisY.Title = "Go/s";
+        area.AxisY.Minimum = 0;
+        area.AxisY.LabelStyle.Format = "0.0";
+        area.AxisX.Title = "secondes";
+        area.AxisX.LabelStyle.Format = "0";
+        area.AxisX.MajorGrid.LineColor = Color.Gainsboro;
+        area.AxisY.MajorGrid.LineColor = Color.Gainsboro;
+        chart.ChartAreas.Add(area);
+        chart.Legends.Add(new Legend("legende"));
+        chart.Legends[0].Docking = Docking.Bottom;
+        chart.Legends[0].Alignment = StringAlignment.Center;
+        Title chartTitle = new Title();
+        chartTitle.Text = "Trafic PCIe reel de chaque carte graphique (rx = vers la carte, tx = depuis la carte)";
+        chartTitle.Font = new Font("Segoe UI", 10f, FontStyle.Bold);
+        chart.Titles.Add(chartTitle);
+
+        pNv.Controls.Add(chart);
+        pNv.Controls.Add(lvNv);
+        pNv.Controls.Add(bar4);
+
+
         Panel bar3 = new Panel();
         bar3.Dock = DockStyle.Top;
         bar3.Height = 34;
@@ -1109,12 +1570,157 @@ public sealed class MainForm : Form
         RefreshGpus();
         RefreshPcie(true);
         timer.Start();
+        // demarrage automatique de la mesure du trafic PCIe reel
+        if (NvTraffic.FindSmi() != null)
+        {
+            nv.Start();
+            btnNv.Text = "Arreter la mesure";
+        }
+        lblNvStatus.Text = nv.Status;
+        RedrawChart();
+    }
+
+    protected override void OnFormClosed(FormClosedEventArgs e)
+    {
+        nv.Stop();
+        base.OnFormClosed(e);
     }
 
     void OnTick(object s, EventArgs e)
     {
+        if (nv.IsRunning) RefreshNv();
         if (!chkAuto.Checked) return;
         RefreshPcie(false);
+    }
+
+    // ---- debit PCIe en direct ------------------------------------------
+
+    void OnNvToggle(object s, EventArgs e)
+    {
+        if (nv.IsRunning)
+        {
+            nv.Stop();
+            btnNv.Text = "Demarrer la mesure";
+        }
+        else
+        {
+            nv.Start();
+            if (nv.IsRunning) btnNv.Text = "Arreter la mesure";
+        }
+        lblNvStatus.Text = nv.Status;
+        RedrawChart();
+    }
+
+    int NvWindowSeconds()
+    {
+        switch (cmbNvWin.SelectedIndex)
+        {
+            case 0: return 60;
+            case 1: return 300;
+            case 3: return 1800;
+            case 4: return 3600;
+            default: return 900;
+        }
+    }
+
+    void RefreshNv()
+    {
+        lblNvStatus.Text = nv.Status;
+        RedrawChart();
+
+        List<NvGpu> gs = nv.Gpus();
+        lvNv.BeginUpdate();
+        lvNv.Items.Clear();
+        // les valeurs sont deja converties en Go/s par NvTraffic.HandleLine
+        foreach (NvGpu g in gs)
+        {
+            ListViewItem it = new ListViewItem(g.Index.ToString(CultureInfo.InvariantCulture));
+            it.SubItems.Add(g.Name);
+            it.SubItems.Add(g.Bus);
+            it.SubItems.Add(g.LastRx.ToString("0.00", CultureInfo.InvariantCulture));
+            it.SubItems.Add(g.LastTx.ToString("0.00", CultureInfo.InvariantCulture));
+            it.SubItems.Add(g.MaxRx.ToString("0.00", CultureInfo.InvariantCulture));
+            it.SubItems.Add(g.MaxTx.ToString("0.00", CultureInfo.InvariantCulture));
+            it.SubItems.Add(g.Count > 0 ? (g.SumRx / g.Count).ToString("0.00", CultureInfo.InvariantCulture) : "-");
+            it.SubItems.Add(g.Count > 0 ? (g.SumTx / g.Count).ToString("0.00", CultureInfo.InvariantCulture) : "-");
+            it.SubItems.Add(g.Count.ToString(CultureInfo.InvariantCulture));
+            lvNv.Items.Add(it);
+
+            double peak = Math.Max(g.MaxRx, g.MaxTx);
+            double old;
+            nvPeak.TryGetValue(g.Index, out old);
+            if (peak > old + 0.05)
+            {
+                nvPeak[g.Index] = peak;
+                History.RecordMeasure(g.Name, "trafic PCIe rx/tx (pilote NVIDIA)",
+                                      peak.ToString("0.00", CultureInfo.InvariantCulture) + " Go/s");
+            }
+        }
+        lvNv.EndUpdate();
+    }
+
+    void RedrawChart()
+    {
+        List<NvGpu> gs = nv.Gpus();
+
+        // Samples() attend un NOMBRE d'echantillons. "dmon -s t" produit
+        // environ une ligne par carte et par seconde : la fenetre en secondes
+        // doit donc etre multipliee par le nombre de cartes.
+        int perGpu = Math.Max(1, gs.Count);
+        List<NvSample> ss = nv.Samples(NvWindowSeconds() * perGpu);
+
+        chart.Series.Clear();
+        if (ss.Count == 0) return;
+
+        // une serie par carte graphique, couleur fixe par index
+        Dictionary<int, Series> map = new Dictionary<int, Series>();
+        foreach (NvGpu g in gs)
+        {
+            string name = "GPU " + g.Index.ToString(CultureInfo.InvariantCulture) + " : " + g.Name;
+            Series ser = new Series(name);
+            ser.ChartType = SeriesChartType.Line;
+            ser.BorderWidth = 2;
+            ser.Color = NvColors[g.Index % NvColors.Length];
+            chart.Series.Add(ser);
+            map[g.Index] = ser;
+        }
+
+        // abscisse = secondes ecoulees depuis le premier echantillon de la fenetre
+        DateTime t0 = ss[0].T;
+        double dataMax = 0;
+        foreach (NvSample smp in ss)
+        {
+            Series ser;
+            if (!map.TryGetValue(smp.Index, out ser)) continue;
+            double x = (smp.T - t0).TotalSeconds;
+            // rx et tx sont deja en Go/s (conversion faite par HandleLine)
+            double y = Math.Max(smp.Rx, smp.Tx);
+            if (y > dataMax) dataMax = y;
+            ser.Points.AddXY(x, y);
+        }
+
+        // repere : budget theorique de la liaison la plus rapide detectee.
+        // L'echelle verticale est etendue pour que le repere reste visible,
+        // mais seulement si le budget reste du meme ordre de grandeur que le
+        // trafic mesure (sinon les courbes seraient ecrasees).
+        chart.ChartAreas[0].AxisY.StripLines.Clear();
+        double budget = 0;
+        foreach (PcieLink l in links) if (l.CurrentGBs() > budget) budget = l.CurrentGBs();
+        double yMax = Math.Max(dataMax * 1.15, 1.0);
+        if (budget > 0 && budget <= dataMax * 4.0)
+        {
+            StripLine sl = new StripLine();
+            sl.Interval = 0;
+            sl.BorderWidth = 2;
+            sl.BorderColor = Color.DimGray;
+            sl.IntervalOffset = budget;
+            chart.ChartAreas[0].AxisY.StripLines.Add(sl);
+            yMax = Math.Max(yMax, budget * 1.08);
+        }
+        chart.ChartAreas[0].AxisY.Maximum = yMax;
+
+        double span = (ss[ss.Count - 1].T - t0).TotalSeconds;
+        chart.ChartAreas[0].AxisX.Maximum = Math.Max(10, span);
     }
 
     // ---- rafraichissement ----------------------------------------------
@@ -1186,6 +1792,15 @@ public sealed class MainForm : Form
         sb.AppendLine("La ligne \u00ab Reference CPU (memcpy) \u00bb sert de garde-fou : une mesure GPU superieure a plus de 2,5 fois ce reference signalerait une copie elidee par le pilote, donc non mesurable.");
         sb.AppendLine("Ces chiffres mesurent le chemin GPU<->systeme (le lien PCIe pour une carte discrete), pas la bande passante de la memoire video interne, qui necessiterait CUDA ou OpenCL.");
         sb.AppendLine("La mesure utilise l'adaptateur Direct3D par defaut de la session : sur une machine multi-cartes, elle ne concerne pas necessairement la carte affichee en premiere ligne.");
+        sb.AppendLine("Direct3D 11 ne permet pas de memorie verrouillee (pinned) et ne fournit pas d'equivalent de cudaHostAlloc : le pilote copie deux fois (vers sa zone intermediaire puis vers la carte) et le chronometre s'arrete quand la copie est seulement SUBMISSIONNEE, pas terminee. Les chiffres D3D11 sont donc une borne basse. Pour le debit reel, utilisez l'onglet \u00ab Debit PCIe en direct \u00bb.");
+        sb.AppendLine();
+        sb.AppendLine();
+        sb.AppendLine("DEBIT PCIe EN DIRECT (valeurs mesurees par le pilote NVIDIA)");
+        sb.AppendLine();
+        sb.AppendLine("L'onglet \u00ab Debit PCIe en direct \u00bb ne fait aucune mesure manuelle : il lit la sortie de \u00ab nvidia-smi dmon -s t \u00bb, c'est-a-dire les compteurs du pilote NVIDIA qui comptent les octets effectivement echanges sur le lien PCI Express de chaque carte. Une courbe par carte, rx = trafic vers la carte, tx = trafic depuis la carte, en Go/s.");
+        sb.AppendLine("C'est la mesure de reference sur une machine NVIDIA : elle inclut tout le trafic du lien (chargement des poids, transferts d'affichage, NVLink le cas echeant), y compris celui des programmes que vous lancez, par exemple un LLM.");
+        sb.AppendLine("La ligne horizontale grise represente le plafond theorique du lien le plus rapide de la machine (generation x largeur, cf. onglet \u00ab Liaisons PCIe \u00bb). Elle n'apparait que si le trafic observe est du meme ordre de grandeur, pour ne pas ecraser les courbes.");
+        sb.AppendLine("Cet onglet necessite le pilote NVIDIA (nvidia-smi doit etre accessible). Sur une machine sans GPU NVIDIA, il reste vide et l'application fonctionne normalement avec les trois autres onglets.");
         txtNote.Text = sb.ToString();
     }
 
