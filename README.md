@@ -13,7 +13,7 @@ Un seul fichier C#, aucune dépendance, aucun installateur, aucun droit administ
 
 Package prêt à déployer sur n'importe quel PC Windows 11 (x64 ou ARM64) :
 
-**[GpuMonitor-Windows11.zip](./dist/GpuMonitor-Windows11.zip)** — 55 Ko, tag [`v1.3`](../../releases/tag/v1.3)
+**[GpuMonitor-Windows11.zip](./dist/GpuMonitor-Windows11.zip)** — tag [`v1.4`](../../releases/tag/v1.4)
 
 Lien direct : <https://github.com/Superloulou/monitor-pci/raw/main/dist/GpuMonitor-Windows11.zip>
 
@@ -29,7 +29,7 @@ livré dans le package.
 |---|---|
 | **Cartes graphiques** | Chaque carte vidéo détectée (nom, fabricant, mémoire dédiée, définition, identifiant PnP) avec sa liaison PCIe réelle : génération (Gen1 → Gen6), largeur (x1/x4/x8/x16), débit actuel, débit maximal, et la chaîne d'ancêtres (carte → port racine PCIe → bus PCI). Le bouton *Mesurer les transferts* lance des copies réelles CPU → GPU, GPU → GPU, GPU → CPU et copie système, et affiche le débit en Go/s pour chaque sens. |
 | **Liaisons PCIe** | Inventaire de **tous** les périphériques branchés sur le bus PCI Express de la machine (cartes vidéo, SSD NVMe, carte WiFi, etc.) : génération, largeur, débit actuel, débit maximal. |
-| **Débit PCIe en direct** | **Graphe du trafic PCIe réellement mesuré par le pilote NVIDIA** (`nvidia-smi dmon -s t`) : une courbe par carte graphique, en Go/s, rafraîchie chaque seconde. Aucune mesure manuelle n'est lancée — ce sont les compteurs du pilote. Le tableau sous le graphe donne, pour chaque carte, le rx/tx instantané, le max et la moyenne. |
+| **Débit PCIe en direct** | **Graphe du trafic PCIe réellement mesuré par le pilote NVIDIA** (`nvidia-smi dmon -s t`) : une courbe par carte graphique, en Go/s, rafraîchie chaque seconde, avec une ligne pointillée indiquant le plafond théorique **de chaque carte**. Aucune mesure manuelle n'est lancée — ce sont les compteurs du pilote. Le tableau sous le graphe donne, pour chaque carte, sa liaison PCIe, le rx/tx instantané, le max et la moyenne. |
 | **Historique** | Trace de chaque changement de liaison (ex. la carte est passée de x8 à x16) et de chaque mesure de transfert. En mémoire uniquement : vidé à chaque démarrage. |
 
 ## L'onglet « Débit PCIe en direct »
@@ -41,9 +41,22 @@ LLM : il enregistre **tout** le trafic qui passe sur le lien PCIe, sans rien gé
   envoyé par la carte. Les deux sont additionnés sur le graphe (la courbe montre le pic rx/tx).
 - Le graphe démarre automatiquement au lancement si un pilote NVIDIA est présent ; sinon le
   bouton *Demarrer la mesure* tente de le lancer.
-- **Ligne horizontale grise** = plafond théorique du lien PCIe le plus rapide de la machine
-  (débit de la liaison négociée, pas la capacité de la carte). Elle n'est affichée que si le
-  trafic mesuré est du même ordre de grandeur.
+- **Une ligne pointillée par carte** = plafond théorique du lien PCIe de **cette** carte (génération ×
+  largeur, colonne *Lien PCIe* du tableau), et non celui de toute la machine. Couleur identique à la
+  courbe de la carte. Elle n'est affichée que si le trafic mesuré est du même ordre de grandeur, pour
+  ne pas écraser les courbes.
+- Un dépassement de quelques pour cent du plafond est normal (compteurs échantillonnés sur une période,
+  arrondis, et lien Gen4 pouvant monter au-delà de la valeur nominale). Un dépassement important était
+  un **bug de lecture des colonnes**, corrigé en v1.4 : le parseur reconnaît désormais `rxpci`/`txpci`
+  **par leur nom** dans l'en-tête de `nvidia-smi`, au lieu de deviner leur position. Les colonnes NVLink
+  (`nvlrx`/`nvltx`) sont volontairement ignorées — elles ne passent pas par le port PCIe.
+- Vérification intégrée, même sans carte NVIDIA : le programme rejoue sept mises en situation réelles
+  (sorties `dmon -s t`, `dmon -s put`, CSV GPM, colonnes NVLink, tirets).
+  - À l'écran : `powershell -NoProfile -ExecutionPolicy Bypass -STA -File .\lancer-sans-exe.ps1 -SelfTest`
+    — doit afficher `parseur : OK (7 mises en situation verifiees)`.
+  - `GPU-Monitor.exe -SelfTest` fait le même contrôle, mais n'affiche rien (programme sans console) : il
+    écrit un rapport `SelfTest-<date>-<heure>.txt` **à côté de l'exe** ; ouvrir ce fichier et chercher la
+    ligne `parseur : OK`.
 - Fenêtre d'affichage réglable : 1 min, 5 min, 15 min (défaut), 30 min, 1 h.
 - **Axe horizontal : l'heure réelle** de chaque échantillon (`hh:mm:ss`), et non un nombre de
   secondes écoulées depuis le début de la mesure. L'espacement des graduations s'adapte à la
@@ -92,6 +105,7 @@ Windows s'il n'est pas encore présent, puis ouvre la fenêtre.
 | `installer.cmd` | Recompile `GpuMonitor.exe` à partir de `GpuMonitor.cs` avec le `csc.exe` de Windows. |
 | `lancer-sans-exe.ps1` | Compile et lance **sans écrire de .exe sur le disque** (si AppLocker / WDAC / SmartScreen bloque les exécutables non signés). |
 | `lancer-gpumonitor.ps1` / `.cmd` | Même méthode « sans .exe », côté développeur. |
+| `smi-t-capture.cmd` | Double-cliquer sur un PC NVIDIA : enregistre la sortie réelle de `nvidia-smi` (versions, liaison, `dmon -s t`, `dmon -s put`) dans `capture-dmon.txt` sur le Bureau. Sert à vérifier le parseur sur une machine précise. |
 | `GpuMonitor.cs` | Le code source complet (un seul fichier). |
 | `README.txt` | Le mode d'emploi livré dans le package (même contenu que ce fichier). |
 | `dist/GpuMonitor-Windows11.zip` | Archive prête à télécharger (le package complet, exe inclus). |

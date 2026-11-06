@@ -871,10 +871,12 @@ public sealed class NvTraffic
     string smiPath = "";
     string status = "non demarre";
     bool running;
-    int skipHeader;
-    int rxCol = -1, txCol = -1;
-    bool unitIsGb;
+    // Colonnes reperees dans l'en-tete (index -1 = pas trouve).
+    int rxCol = -1, txCol = -1, idxCol = -1;
+    int headerLen;                 // nombre de colonnes annonce par l'en-tete
+    bool unitIsGb;                 // l'en-tete annonce « GB/s » au lieu de « MB/s »
     long lastLineTicks;
+    string layout = "";            // en-tete reconnu, affiche dans l'interface
 
     public string Status { get { lock (gate) return status; } }
     public bool IsRunning { get { lock (gate) return running; } }
@@ -888,6 +890,13 @@ public sealed class NvTraffic
                 return (DateTime.Now.Ticks - lastLineTicks) / TimeSpan.TicksPerMillisecond;
             }
         }
+    }
+
+    // En-tete reconnu par le parseur. Vide tant qu'aucun en-tete n'a ete lu :
+    // c'est le moyen le plus sur de verifier que les colonnes sont les bonnes.
+    public string Layout
+    {
+        get { lock (gate) return layout; }
     }
 
     public List<NvGpu> Gpus()
@@ -1065,10 +1074,24 @@ public sealed class NvTraffic
     // -------------------------------------------------------------------
     //  Analyse d'une ligne de dmon
     //
-    //  Exemple (le nombre et l'ordre des colonnes dependent du pilote) :
-    //      # gpu  pci    rx.pci   tx.pci   ...
-    //        0   0000:01:00.0   1234   567   ...
-    //  Les unites peuvent etre Mo/s ou GB/s selon la version.
+    //  Le nombre et l'ordre des colonnes dependent du pilote et des options.
+    //  Formes rencontrees dans les journaux reels :
+    //      # gpu rxpci txpci              (dmon -s t)
+    //      # Idx MB/s MB/s               (ligne des unites)
+    //      # gpu  pwr gtemp mtemp sm mem enc dec rxpci txpci   (dmon -s put)
+    //      #Date, Time, gpu, fb, bar1, ... , rxpci, txpci, ...  (GPM, CSV)
+    //  Regles appliquees :
+    //   - les colonnes rx/tx sont reperees par leur NOM, et seulement sur la
+    //     ligne qui contient a la fois un « rx...pci » et un « tx...pci ».
+    //     Les colonnes NVLink (nvlrx/nvltx) et GPM (pcirx/pcitx) sont exclues.
+    //   - la ligne des unites ne deplace jamais les colonnes deja trouvees ;
+    //     elle ne fait que renseigner l'unite.
+    //   - si les colonnes sont inconnues, la ligne est IGNOREE. On ne devine
+    //     jamais deux nombres au hasard : la consommation (pwr) ou la memoire
+    //     utilisee (fb, bar1) sont des nombres tout aussi valides, et cela a
+    //     deja produit des pics de 19 Go/s sur une liaison Gen4 x8.
+    //   - le pilote affiche « MB/s » mais le compteur NVML travaille en KiB/s :
+    //     on divise donc par 1024 pour obtenir des Go/s.
     // -------------------------------------------------------------------
     void HandleLine(string raw)
     {
@@ -1076,61 +1099,86 @@ public sealed class NvTraffic
         string line = raw.Trim();
         if (line.Length == 0) return;
 
-        if (line[0] == '#')
+        // Le separateur peut etre l'espace, la tabulation ou la virgule (sortie
+        // de type CSV). Certaines versions prefixent les lignes de DONNEES par
+        // « # » (avec -c N) et les pilotes anciens ecrivent « ## ».
+        string body = line;
+        if (body[0] == '#') body = body.TrimStart('#').Trim();
+        if (body.Length == 0) return;
+        string[] f = body.Split(new char[] { ' ', '\t', ',' }, StringSplitOptions.RemoveEmptyEntries);
+        if (f.Length == 0) return;
+
+        // Une ligne qui commence par un nombre est une donnee, sinon un en-tete.
+        if (!(ParseInt(f[0]) < 0))
         {
-            // En-tete : on repere ou se trouvent rx et tx.
-            string[] h = line.Split(new char[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries);
-            int hrx = -1, htx = -1;
-            for (int i = 0; i < h.Length; i++)
-            {
-                string c = h[i].ToLower(CultureInfo.InvariantCulture);
-                if (hrx < 0 && c.IndexOf("rx", StringComparison.Ordinal) >= 0 && c.IndexOf("pci", StringComparison.Ordinal) >= 0) hrx = i;
-                if (htx < 0 && c.IndexOf("tx", StringComparison.Ordinal) >= 0 && c.IndexOf("pci", StringComparison.Ordinal) >= 0) htx = i;
-            }
+            HandleData(f);
+            return;
+        }
+
+        int hrx = -1, htx = -1, hidx = -1;
+        bool hasUnit = false;
+        for (int i = 0; i < f.Length; i++)
+        {
+            string c = f[i].ToLower(CultureInfo.InvariantCulture);
+            if (c.IndexOf("/s", StringComparison.Ordinal) >= 0) hasUnit = true;
+            if (hrx < 0 && ColIsRx(c)) hrx = i;
+            if (htx < 0 && ColIsTx(c)) htx = i;
+            if (hidx < 0 && (c == "gpu" || c == "idx" || c == "index")) hidx = i;
+        }
+
+        // Vraie ligne de noms : des colonnes rx et tx, et aucune unite.
+        if (hrx >= 0 && htx >= 0 && !hasUnit)
+        {
             lock (gate)
             {
-                if (hrx >= 0 && htx >= 0) { rxCol = hrx; txCol = htx; skipHeader = h.Length; }
-                unitIsGb = line.IndexOf("GB/s", StringComparison.OrdinalIgnoreCase) >= 0;
+                rxCol = hrx; txCol = htx; idxCol = hidx; headerLen = f.Length;
+                layout = string.Join(" ", f);
             }
             return;
         }
 
-        string[] f = line.Split(new char[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries);
-        if (f.Length < 3) return;
+        // Ligne d'unites (ou phrase de description) : elle ne doit surtout pas
+        // decaler les colonnes. On n'en lit que l'unite annoncee.
+        for (int i = 0; i < f.Length; i++)
+        {
+            string c = f[i].ToLower(CultureInfo.InvariantCulture);
+            if (c.IndexOf("/s", StringComparison.Ordinal) < 0) continue;
+            bool gbu = c.IndexOf("gb", StringComparison.Ordinal) >= 0 ||
+                       c.IndexOf("gib", StringComparison.Ordinal) >= 0;
+            lock (gate) { unitIsGb = gbu; }
+            break;
+        }
+    }
 
-        int rxColL, txColL, skipL;
+    // Ligne de mesure : les colonnes viennent obligatoirement de l'en-tete.
+    void HandleData(string[] f)
+    {
+        int rxIdx, txIdx, idxIdx;
         bool gb;
-        lock (gate) { rxColL = rxCol; txColL = txCol; skipL = skipHeader; gb = unitIsGb; }
+        lock (gate) { rxIdx = rxCol; txIdx = txCol; idxIdx = idxCol; gb = unitIsGb; }
 
-        int idx = ParseInt(f[0]);
-        if (idx < 0) return;
+        // En-tete pas encore reconnu : on ne devine RIEN. Deviner la premiere
+        // colonne numerique suivante a deja affiche 19 Go/s sur du Gen4 x8 :
+        // c'etait la memoire video utilisee, exprimee en Mo.
+        if (rxIdx < 0 || txIdx < 0) return;
+        if (rxIdx >= f.Length || txIdx >= f.Length) return;
 
-        int rx = -1, tx = -1;
-        if (rxColL >= 0 && txColL >= 0 && f.Length == skipL)
-        {
-            rx = rxColL; tx = txColL;
-        }
-        else
-        {
-            // Plan B : on cherche deux nombres consecutifs apres le bus PCI.
-            // Dans « dmon -s t » il n'y a que ces deux-la.
-            int first = 1;
-            if (f.Length > 1 && f[1].IndexOf(':') >= 0) first = 2;
-            List<int> nums = new List<int>();
-            for (int i = first; i < f.Length && nums.Count < 2; i++)
-            {
-                double d;
-                if (double.TryParse(f[i], NumberStyles.Any, CultureInfo.InvariantCulture, out d)) nums.Add(i);
-            }
-            if (nums.Count < 2) return;
-            rx = nums[0]; tx = nums[1];
-        }
+        int idx;
+        if (idxIdx >= 0 && idxIdx < f.Length) idx = ParseInt(f[idxIdx]);
+        else idx = ParseInt(f[0]);
+        // L'index d'une carte est petit. Cette borne rejette les variantes ou la
+        // premiere colonne est une date (sortie CSV avec --options=DT), qui
+        // creaient une fausse carte « GPU 20250819 ».
+        if (idx < 0 || idx > 1023) return;
 
-        double rxv, txv;
-        if (!double.TryParse(f[rx], NumberStyles.Any, CultureInfo.InvariantCulture, out rxv)) return;
-        if (!double.TryParse(f[tx], NumberStyles.Any, CultureInfo.InvariantCulture, out txv)) return;
+        double rxv = ParseDouble(f[rxIdx]);
+        double txv = ParseDouble(f[txIdx]);
+        // Le pilote affiche « - » quand le compteur n'est pas disponible.
+        if (double.IsNaN(rxv) && double.IsNaN(txv)) return;
+        if (double.IsNaN(rxv)) rxv = 0;
+        if (double.IsNaN(txv)) txv = 0;
 
-        // Unite : « GB/s » dans l'en-tete, sinon Mo/s (le cas courant).
+        // Unite : « GB/s » dans l'en-tete, sinon « MB/s » lu en MiB/s.
         double k = 1.0 / 1024.0;
         if (gb) k = 1.0;
 
@@ -1172,35 +1220,160 @@ public sealed class NvTraffic
         return -1;
     }
 
+    // Retourne NaN quand ce n'est pas un nombre (le pilote affiche « - »).
+    static double ParseDouble(string s)
+    {
+        double v;
+        if (double.TryParse(s.Trim(), NumberStyles.Any, CultureInfo.InvariantCulture, out v)) return v;
+        return double.NaN;
+    }
+
+    // Noms de colonnes : « rxpci », « rx.pci », « pcirx ». On exclut les compteurs
+    // NVLink (« nvlrx » / « nvltx ») qui ne passent pas par le port PCIe.
+    static bool ColIsRx(string c)
+    {
+        if (c.IndexOf("nvl", StringComparison.Ordinal) >= 0) return false;
+        if (c.IndexOf("tx", StringComparison.Ordinal) >= 0) return false;
+        return c.IndexOf("rx", StringComparison.Ordinal) >= 0 &&
+               c.IndexOf("pci", StringComparison.Ordinal) >= 0;
+    }
+
+    static bool ColIsTx(string c)
+    {
+        if (c.IndexOf("nvl", StringComparison.Ordinal) >= 0) return false;
+        if (c.IndexOf("rx", StringComparison.Ordinal) >= 0) return false;
+        return c.IndexOf("tx", StringComparison.Ordinal) >= 0 &&
+               c.IndexOf("pci", StringComparison.Ordinal) >= 0;
+    }
+
     // -------------------------------------------------------------------
     //  Test du parseur (aucune carte NVIDIA n'est necessaire)
     // -------------------------------------------------------------------
+    // Une mise en situation : de vraies sorties de nvidia-smi, avec le rx et le tx attendus.
+    private class Fixture
+    {
+        public string Name;
+        public string[] Lines;
+        public double[][] Want;   // { index GPU, rx attendu en Go/s, tx attendu en Go/s }
+
+        public Fixture(string name, string[] lines, double[][] want)
+        {
+            Name = name; Lines = lines; Want = want;
+        }
+    }
+
+    static Fixture[] ParserFixtures()
+    {
+        return new Fixture[] {
+            new Fixture("A : dmon -s t (format par defaut de l appli)",
+                new string[] {
+                    "# gpu    rxpci    txpci",
+                    "# Idx      MB/s     MB/s",
+                    "0      12345     7500",
+                    "1       3000      900",
+                    "2          0        0",
+                    "0      12000     7400",
+                    "1          -        -" },
+                new double[][] {
+                    new double[] { 0, 11.71875, 7.2265625 },
+                    new double[] { 1, 2.9296875, 0.87890625 },
+                    new double[] { 2, 0, 0 } }),
+
+            new Fixture("B : lignes de donnees prefixees par # (option -c N)",
+                new string[] {
+                    "# gpu    rxpci    txpci",
+                    "# Idx      MB/s     MB/s",
+                    "#   0      759     3606",
+                    "#   1        0        3" },
+                new double[][] {
+                    new double[] { 0, 0.7412109375, 3.521484375 },
+                    new double[] { 1, 0, 0.0029296875 } }),
+
+            new Fixture("C : en-tetes herites ##",
+                new string[] {
+                    "## gpu  rxpci  txpci",
+                    "## Idx  MB/s   MB/s",
+                    "   0     1500    900" },
+                new double[][] {
+                    new double[] { 0, 1.46484375, 0.87890625 } }),
+
+            new Fixture("D : -s put (pwr/gtemp avant rxpci) = le bug des 19 Go/s",
+                new string[] {
+                    "# gpu   pwr  gtemp  mtemp   sm   mem   enc   dec  rxpci  txpci",
+                    "# Idx   W     C      C      %    %     %     %    MB/s   MB/s",
+                    "0       224    43      -     0     0     0     0   19680  16210",
+                    "1        30    50      -     0     0     0     0       0      0" },
+                new double[][] {
+                    new double[] { 0, 19.21875, 15.830078125 },
+                    new double[] { 1, 0, 0 } }),
+
+            new Fixture("E : GPM CSV avec --options=DT",
+                new string[] {
+                    "#Date, Time, gpu, fb, bar1, ccpm, rxpci, txpci, sbecc, dbecc, pci, pcitx, pcirx, nvlrx, nvltx",
+                    "#20250819, 17:21:36, Idx, MB, MB, MB, MB/s, MB/s, errs, errs, errs, GPM:MiB/s, GPM:MiB/s, GPM:MiB/s, GPM:MiB/s",
+                    "20250819, 17:21:36, 2, 16811, 109, 0, 41115, 2741, 0, 0, 0, 4173, 22148, 0, 0" },
+                new double[][] {
+                    new double[] { 2, 40.1513671875, 2.6767578125 } }),
+
+            new Fixture("F : colonnes NVLink (ne doivent jamais etre prises)",
+                new string[] {
+                    "# gpu   rxpci  txpci  nvlrx  nvltx",
+                    "# Idx   MB/s   MB/s   MB/s   MB/s",
+                    "0         0      3   6316   6833" },
+                new double[][] {
+                    new double[] { 0, 0, 0.0029296875 } }),
+
+            new Fixture("G : tirets (valeur indisponible)",
+                new string[] {
+                    "# gpu  rxpci  txpci",
+                    "# Idx  MB/s   MB/s",
+                    "0        -     500" },
+                new double[][] {
+                    new double[] { 0, 0, 0.48828125 } })
+        };
+    }
+
     public static string SelfTestParser()
     {
         StringBuilder o = new StringBuilder();
-        string[] lines = new string[6];
-        lines[0] = "# gpu  pci      rx.pci   tx.pci   fb   cmd   sm   mem   enc   dec   mp   jpeg   ofa";
-        lines[1] = "# Index: PCI bus id ... rx.pci, tx.pci in MB/s";
-        lines[2] = "  0   00000000:01:00.0    1234     567   1234   12   10   20    0     0     0     0      0";
-        lines[3] = "  1   00000000:02:00.0       0       0    456    3    2    5    0     0     0     0      0";
-        lines[4] = "  2   00000000:03:00.0    3000    1500    789    8    4    9    0     0     0     0      0";
-        lines[5] = "  0   00000000:01:00.0    2048    1024   1234   12   10   20    0     0     0     0      0";
-        NvTraffic t = new NvTraffic();
-        foreach (string l in lines) t.HandleLine(l);
-        List<NvSample> ss = t.Samples(100);
-        o.AppendLine("  lignes analysees : " + ss.Count + " (attendu 4)");
-        foreach (NvGpu g in t.Gpus())
-            o.AppendLine("  GPU " + g.Index + " : rx " + g.LastRx.ToString("0.000", CultureInfo.InvariantCulture) +
-                         " Go/s, tx " + g.LastTx.ToString("0.000", CultureInfo.InvariantCulture) +
-                         " Go/s, max rx " + g.MaxRx.ToString("0.000", CultureInfo.InvariantCulture) +
-                         " (echantillons " + g.Count.ToString(CultureInfo.InvariantCulture) + ")");
-        bool ok = ss.Count == 4;
-        foreach (NvGpu g in t.Gpus())
+        Fixture[] cases = ParserFixtures();
+        int fail = 0;
+        foreach (Fixture c in cases)
         {
-            if (g.Index == 0 && Math.Abs(g.MaxRx - 2.0) > 0.001) ok = false;
-            if (g.Index == 2 && Math.Abs(g.LastRx - 2.9296875) > 0.001) ok = false;
+            NvTraffic t = new NvTraffic();
+            foreach (string l in c.Lines) t.HandleLine(l);
+            List<NvGpu> gs = t.Gpus();
+            o.AppendLine("  " + c.Name + " : " + gs.Count.ToString(CultureInfo.InvariantCulture) +
+                         " GPU, " + t.SampleCount().ToString(CultureInfo.InvariantCulture) + " echantillons");
+            if (gs.Count != c.Want.Length)
+            {
+                o.AppendLine("     ECHEC : " + c.Want.Length.ToString(CultureInfo.InvariantCulture) +
+                             " GPU attendus");
+                fail++;
+            }
+            foreach (double[] w in c.Want)
+            {
+                int idx = (int) w[0];
+                NvGpu found = null;
+                foreach (NvGpu g in gs) if (g.Index == idx) found = g;
+                if (found == null)
+                {
+                    o.AppendLine("     ECHEC : GPU " + idx.ToString(CultureInfo.InvariantCulture) + " absent");
+                    fail++;
+                    continue;
+                }
+                bool ok = Math.Abs(found.LastRx - w[1]) < 1e-6 && Math.Abs(found.LastTx - w[2]) < 1e-6;
+                if (!ok) fail++;
+                o.AppendLine("     GPU " + idx.ToString(CultureInfo.InvariantCulture) +
+                             " rx " + found.LastRx.ToString("0.000", CultureInfo.InvariantCulture) +
+                             " Go/s, tx " + found.LastTx.ToString("0.000", CultureInfo.InvariantCulture) +
+                             " Go/s " + (ok ? "OK" :
+                             "ECHEC (attendu rx " + w[1].ToString("0.000", CultureInfo.InvariantCulture) +
+                             ", tx " + w[2].ToString("0.000", CultureInfo.InvariantCulture) + ")"));
+            }
         }
-        o.AppendLine("  parseur : " + (ok ? "OK" : "ECHEC"));
+        o.AppendLine("  parseur : " + (fail == 0 ? "OK (" + cases.Length.ToString(CultureInfo.InvariantCulture) +
+                     " mises en situation verifiees)" : "ECHEC (" + fail.ToString(CultureInfo.InvariantCulture) + " erreurs)"));
         return o.ToString();
     }
 }
@@ -1323,7 +1496,7 @@ public sealed class MainForm : Form
 
     public MainForm()
     {
-        Text = "Moniteur GPU / PCIe - vitesse de transfert et historique des liaisons";
+        Text = "Moniteur GPU / PCIe - vitesse de transfert et historique des liaisons (v1.4)";
         Width = 1120;
         Height = 720;
         // empeche la fenetre d'etre reduite au point d'ecraser le graphe (hauteur <= 0)
@@ -1497,6 +1670,7 @@ public sealed class MainForm : Form
             new string[] { "GPU", "60" },
             new string[] { "Carte graphique", "260" },
             new string[] { "Bus PCIe", "110" },
+            new string[] { "Lien PCIe", "120" },
             new string[] { "rx PCIe instantane (Go/s)", "150" },
             new string[] { "tx PCIe instantane (Go/s)", "150" },
             new string[] { "rx max (Go/s)", "110" },
@@ -1623,20 +1797,59 @@ public sealed class MainForm : Form
         }
     }
 
+    // Rattache un GPU annonce par nvidia-smi a la carte PCIe correspondante.
+    // L'index dmon n'est pas garanti identique a l'ordre WMI : on matche d'abord
+    // par le nom, puis par l'ordre, puis quand il n'y a qu'une seule carte.
+    Dictionary<int, PcieLink> NvLinks(List<NvGpu> gs)
+    {
+        Dictionary<int, PcieLink> res = new Dictionary<int, PcieLink>();
+        List<GpuInfo> pool = new List<GpuInfo>();
+        foreach (GpuInfo gi in gpus)
+            if (gi.Link != null && gi.Link.HasLink) pool.Add(gi);
+
+        foreach (NvGpu g in gs)
+        {
+            GpuInfo hit = null;
+            foreach (GpuInfo gi in pool)
+                if (string.Equals(gi.Name, g.Name, StringComparison.OrdinalIgnoreCase)) { hit = gi; break; }
+            if (hit == null && g.Index >= 0 && g.Index < pool.Count) hit = pool[g.Index];
+            // Dernier recours : une seule carte NVIDIA d'un cote comme de l'autre.
+            if (hit == null && pool.Count == 1 && gs.Count == 1 &&
+                (pool[0].IsHardware || g.Name.IndexOf("NVIDIA", StringComparison.OrdinalIgnoreCase) >= 0))
+                hit = pool[0];
+            if (hit != null)
+            {
+                res[g.Index] = hit.Link;
+                pool.Remove(hit);
+            }
+        }
+        return res;
+    }
+
+    static bool ExistsNear(List<double> vals, double v)
+    {
+        foreach (double x in vals) if (Math.Abs(x - v) <= Math.Abs(v) * 0.01) return true;
+        return false;
+    }
+
     void RefreshNv()
     {
         lblNvStatus.Text = nv.Status;
         RedrawChart();
 
         List<NvGpu> gs = nv.Gpus();
+        Dictionary<int, PcieLink> nl = NvLinks(gs);
         lvNv.BeginUpdate();
         lvNv.Items.Clear();
         // les valeurs sont deja converties en Go/s par NvTraffic.HandleLine
         foreach (NvGpu g in gs)
         {
+            PcieLink lk;
+            nl.TryGetValue(g.Index, out lk);
             ListViewItem it = new ListViewItem(g.Index.ToString(CultureInfo.InvariantCulture));
             it.SubItems.Add(g.Name);
             it.SubItems.Add(g.Bus);
+            it.SubItems.Add(lk != null ? lk.LinkText() : "inconnu");
             it.SubItems.Add(g.LastRx.ToString("0.00", CultureInfo.InvariantCulture));
             it.SubItems.Add(g.LastTx.ToString("0.00", CultureInfo.InvariantCulture));
             it.SubItems.Add(g.MaxRx.ToString("0.00", CultureInfo.InvariantCulture));
@@ -1687,6 +1900,7 @@ public sealed class MainForm : Form
 
         // abscisse = heure reelle de chaque echantillon
         double dataMax = 0;
+        List<int> plotted = new List<int>();
         foreach (NvSample smp in ss)
         {
             Series ser;
@@ -1695,23 +1909,38 @@ public sealed class MainForm : Form
             double y = Math.Max(smp.Rx, smp.Tx);
             if (y > dataMax) dataMax = y;
             ser.Points.AddXY(smp.T.ToOADate(), y);
+            if (!plotted.Contains(smp.Index)) plotted.Add(smp.Index);
         }
 
-        // repere : budget theorique de la liaison la plus rapide detectee.
-        // L'echelle verticale est etendue pour que le repere reste visible,
-        // mais seulement si le budget reste du meme ordre de grandeur que le
-        // trafic mesure (sinon les courbes seraient ecrasees).
+        // reperes : budget theorique du lien de CHAQUE carte tracee, et non le
+        // lien le plus rapide de la machine. Une carte en x8 ne doit pas etre
+        // comparee au plafond d'une carte en x16. L'echelle verticale est
+        // etendue pour que le repere reste visible, mais seulement si le
+        // budget reste du meme ordre de grandeur que le trafic mesure.
         chart.ChartAreas[0].AxisY.StripLines.Clear();
-        double budget = 0;
-        foreach (PcieLink l in links) if (l.CurrentGBs() > budget) budget = l.CurrentGBs();
         double yMax = Math.Max(dataMax * 1.15, 1.0);
-        if (budget > 0 && budget <= dataMax * 4.0)
+        Dictionary<int, PcieLink> nl = NvLinks(gs);
+        List<double> drawn = new List<double>();
+        foreach (KeyValuePair<int, PcieLink> kv in nl)
         {
+            if (!plotted.Contains(kv.Key)) continue;
+            double budget = kv.Value.CurrentGBs();
+            if (budget <= 0 || budget > dataMax * 4.0) continue;
+            // deux cartes au lien identique -> une seule ligne
+            if (ExistsNear(drawn, budget)) continue;
+            drawn.Add(budget);
+
             StripLine sl = new StripLine();
             sl.Interval = 0;
             sl.BorderWidth = 2;
-            sl.BorderColor = Color.DimGray;
+            sl.BorderColor = NvColors[kv.Key % NvColors.Length];
+            sl.BorderDashStyle = ChartDashStyle.Dash;
             sl.IntervalOffset = budget;
+            sl.Text = "GPU " + kv.Key.ToString(CultureInfo.InvariantCulture) + "  " +
+                      kv.Value.LinkText() + " = " +
+                      budget.ToString("0.00", CultureInfo.InvariantCulture) + " Go/s";
+            sl.TextAlignment = StringAlignment.Near;
+            sl.TextLineAlignment = StringAlignment.Near;
             chart.ChartAreas[0].AxisY.StripLines.Add(sl);
             yMax = Math.Max(yMax, budget * 1.08);
         }
@@ -1807,8 +2036,10 @@ public sealed class MainForm : Form
         sb.AppendLine("DEBIT PCIe EN DIRECT (valeurs mesurees par le pilote NVIDIA)");
         sb.AppendLine();
         sb.AppendLine("L'onglet \u00ab Debit PCIe en direct \u00bb ne fait aucune mesure manuelle : il lit la sortie de \u00ab nvidia-smi dmon -s t \u00bb, c'est-a-dire les compteurs du pilote NVIDIA qui comptent les octets effectivement echanges sur le lien PCI Express de chaque carte. Une courbe par carte, rx = trafic vers la carte, tx = trafic depuis la carte, en Go/s.");
-        sb.AppendLine("C'est la mesure de reference sur une machine NVIDIA : elle inclut tout le trafic du lien (chargement des poids, transferts d'affichage, NVLink le cas echeant), y compris celui des programmes que vous lancez, par exemple un LLM.");
-        sb.AppendLine("La ligne horizontale grise represente le plafond theorique du lien le plus rapide de la machine (generation x largeur, cf. onglet \u00ab Liaisons PCIe \u00bb). Elle n'apparait que si le trafic observe est du meme ordre de grandeur, pour ne pas ecraser les courbes.");
+        sb.AppendLine("C'est la mesure de reference sur une machine NVIDIA : elle compte tout le trafic du lien PCI Express de la carte (chargement des poids, transferts d'affichage, transferts vers un autre GPU par PCIe), y compris celui des programmes que vous lancez, par exemple un LLM. Le trafic NVLink n'est PAS compte ici : les colonnes NVLink (nvlrx/nvltx) sont volontairement ignorees, puisqu'elles ne passent pas par le port PCIe.");
+        sb.AppendLine("Le parseur ne se fie jamais a la position des colonnes : il les reconnait par leur nom dans l'en-tete de \u00ab nvidia-smi \u00bb. Une version precedente lisait les colonnes de puissance et de temperature comme si c'etaient des debits, ce qui donnait des valeurs depassant le plafond du lien. Le programme rejoue sept mises en situation reelles : \u00ab GPU-Monitor.exe -SelfTest \u00bb ecrit un rapport SelfTest-date.txt a cote de l'executable (chercher la ligne \u00ab parseur : OK \u00bb), et \u00ab lancer-sans-exe.ps1 -SelfTest \u00bb l'affiche a l'ecran.");
+        sb.AppendLine("Une ligne pointillee par carte represente le plafond theorique du lien de CETTE carte (generation x largeur, colonne \u00ab Lien PCIe \u00bb), et non celui de toute la machine. Elle n'apparait que si le trafic observe est du meme ordre de grandeur, pour ne pas ecraser les courbes.");
+        sb.AppendLine("Le debit affiche peut legagerement depasser le plafond theorique : les compteurs du pilote NVIDIA sont echantillonnes sur une periode et arrondis, et le lien Gen4 peut monter au-dela de la valeur nominale une fois l'economie d'energie desactivee. Un depassement de quelques pour cent est normal ; un depassement important etait un bug de lecture des colonnes, corrige en version 1.4.");
         sb.AppendLine("L'axe horizontal du graphe affiche l'heure reelle de chaque echantillon (format hh:mm:ss), et non un nombre de secondes ecoulees depuis le debut de la mesure. L'espacement des graduations s'adapte a la fenetre choisie : 10 secondes pour 1 minute, 1 minute pour 5 ou 15 minutes, 5 minutes pour 30 minutes et 15 minutes pour 1 heure.");
         sb.AppendLine("Cet onglet necessite le pilote NVIDIA (nvidia-smi doit etre accessible). Sur une machine sans GPU NVIDIA, il reste vide et l'application fonctionne normalement avec les trois autres onglets.");
         txtNote.Text = sb.ToString();

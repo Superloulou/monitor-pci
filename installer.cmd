@@ -22,9 +22,9 @@ exit /b 2
 :compiler
 echo Compilation de GpuMonitor.exe ...
 if exist "%CSC64%" (
-  "%CSC64%" /nologo /platform:anycpu /target:winexe /optimize+ /out:GpuMonitor.exe GpuMonitor.cs /r:System.dll,System.Core.dll,System.Windows.Forms.dll,System.Drawing.dll,System.Management.dll
+  "%CSC64%" /nologo /platform:anycpu /target:winexe /optimize+ /out:GpuMonitor.exe GpuMonitor.cs /r:System.dll,System.Core.dll,System.Windows.Forms.dll,System.Drawing.dll,System.Management.dll,System.Windows.Forms.DataVisualization.dll
 ) else (
-  "%CSC32%" /nologo /platform:anycpu /target:winexe /optimize+ /out:GpuMonitor.exe GpuMonitor.cs /r:System.dll,System.Core.dll,System.Windows.Forms.dll,System.Drawing.dll,System.Management.dll
+  "%CSC32%" /nologo /platform:anycpu /target:winexe /optimize+ /out:GpuMonitor.exe GpuMonitor.cs /r:System.dll,System.Core.dll,System.Windows.Forms.dll,System.Drawing.dll,System.Management.dll,System.Windows.Forms.DataVisualization.dll
 )
 
 if not exist "GpuMonitor.exe" (

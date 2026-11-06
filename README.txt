@@ -24,9 +24,10 @@ Quatre onglets :
 
   * Debit PCIe en direct
       Graphe temps reel du trafic PCIe REELLEMENT MESURE PAR LE
-      PILOTE NVIDIA (une courbe par carte graphique). Aucune mesure
-      manuelle : le programme lit les compteurs du pilote via
-      "nvidia-smi dmon -s t". Voir le point 8 bis.
+      PILOTE NVIDIA (une courbe par carte graphique, plus une ligne
+      pointillee indiquant le plafond theorique de CHAQUE carte).
+      Aucune mesure manuelle : le programme lit les compteurs du
+      pilote via "nvidia-smi dmon -s t". Voir le point 8 bis.
 
   * Historique
       Trace de chaque changement de liaison (ex : la carte est
@@ -91,6 +92,11 @@ fichier ailleurs.
                           sur le disque (compile en memoire). A
                           utiliser si la securite de la machine bloque
                           les executables non signes.
+  smi-t-capture.cmd       Double-cliquer sur un PC NVIDIA : enregistre
+                          la sortie reelle de "nvidia-smi" (versions,
+                          liaison, dmon -s t, dmon -s put) dans
+                          capture-dmon.txt sur le Bureau. Sert a
+                          verifier le parseur sur une machine precise.
   README.txt              Ce fichier.
   (Le package complet est distribue sous forme d'archive :
    GpuMonitor-Windows11.zip, dans le dossier "dist" du depot GitHub.)
@@ -179,12 +185,39 @@ verifier a distance.
     NVIDIA. Sur un PC sans GPU NVIDIA, l'onglet reste vide et le
     message "nvidia-smi introuvable" s'affiche.
 
-  * Ligne horizontale grise = plafond theorique de la liaison PCIe la
-    plus rapide du PC (debit calcule a partir de la generation et du
-    nombre de lignes negocies). Elle n'apparait que si le trafic
-    mesure est du meme ordre de grandeur. Si la courbe reste tres en
-    dessous, la liaison n'est pas saturee : c'est le logiciel, pas le
-    bus, qui limite.
+  * Une ligne pointillee PAR CARTE = plafond theorique du lien de
+    CETTE carte (generation x largeur, colonne "Lien PCIe" du tableau
+    sous le graphe), et non celui de toute la machine. Meme couleur
+    que la courbe de la carte. Elle n'apparait que si le trafic mesure
+    est du meme ordre de grandeur. Si la courbe reste tres en dessous,
+    la liaison n'est pas saturee : c'est le logiciel, pas le bus, qui
+    limite.
+
+  * Le tableau sous le graphe donne, pour chaque carte, sa liaison
+    PCIe (ex : Gen4 x8), le debit rx/tx instantane, le maximum et la
+    moyenne.
+
+  * Le debit affiche peut legagerement depasser le plafond theorique :
+    les compteurs du pilote sont echantillonnes sur une periode et
+    arrondis, et le lien Gen4 peut monter au-dela de la valeur
+    nominale. Un depassement de quelques pour cent est normal. Un
+    depassement important etait un bug de lecture des colonnes,
+    corrige en version 1.4 : le parseur reconnait maintenant les
+    colonnes rx.pci / tx.pci par leur nom dans l'en-tete de
+    "nvidia-smi", au lieu de deviner leur position. Les colonnes
+    NVLink (nvlrx / nvltx) sont volontairement ignorees : elles ne
+    passent pas par le port PCIe.
+
+  * Verification integree, sans carte NVIDIA : le programme rejoue sept mises
+    en situation reelles (dmon -s t, dmon -s put, CSV GPM, colonnes NVLink,
+    tirets). Deux facons de la lancer :
+      - A l'ecran :
+        powershell -NoProfile -ExecutionPolicy Bypass -STA -File "lancer-sans-exe.ps1" -SelfTest
+        Doit afficher "parseur : OK (7 mises en situation verifiees)".
+      - "GPU-Monitor.exe -SelfTest" fait le meme controle mais n'affiche rien
+        (programme sans console) : il ecrit un rapport
+        "SelfTest-<date>-<heure>.txt" a cote de l'executable. Ouvrir ce
+        fichier et chercher la ligne "parseur : OK".
 
   * Verifier d'abord la liaison negocee (onglet "Liaisons PCIe") : une
     carte Gen4 x8 ne peut pas depasser 14,67 Go/s, alors qu'en x16 elle
